@@ -479,7 +479,9 @@ impl App {
             Some(Preview::Listing { entries, total }) => View::Listing(entries.clone(), *total),
             Some(Preview::Audio) => View::Audio,
             Some(Preview::Unavailable { reason }) => View::Other(Some(reason.clone())),
-            _ => View::Other(None),
+            Some(_) => View::Other(Some("No preview for this kind of file. Press Enter to open it.".to_string())),
+            // Still on its way, so there's nothing to say about it yet.
+            None => View::Other(None),
         };
         match view {
             View::Image(iw, ih) => {
@@ -571,10 +573,11 @@ impl App {
                     lift: 1.0,
                     dim: 0.0,
                 });
-                let text = reason.unwrap_or_else(|| "No preview for this kind of file. Press Enter to open it.".to_string());
-                let tw = self.text.width(&text, Face::Ui, 15.0 * s);
-                let out = &mut self.draw.ui[QUICK_CLIP].glyphs;
-                draw_text(&mut self.text, out, &text, Face::Ui, 15.0 * s, center[0] - tw * 0.5, center[1] + 110.0 * s, rgb(p::CREAM), NO_HALO);
+                if let Some(text) = reason {
+                    let tw = self.text.width(&text, Face::Ui, 15.0 * s);
+                    let out = &mut self.draw.ui[QUICK_CLIP].glyphs;
+                    draw_text(&mut self.text, out, &text, Face::Ui, 15.0 * s, center[0] - tw * 0.5, center[1] + 110.0 * s, rgb(p::CREAM), NO_HALO);
+                }
             }
         }
         // Slide and fade the whole sheet in, except its backdrop, which already fades itself.

@@ -234,6 +234,8 @@ pub struct Actions {
     /// Hover and press animation amounts for each control.
     pub hover: rustc_hash::FxHashMap<Action, f32>,
     pub panel_in: f32,
+    /// Quick Look has moved on, and is still showing the last file until the next one arrives.
+    pub quick_stale: bool,
     pub ui_dt: f32,
 }
 
@@ -543,11 +545,13 @@ impl App {
         if self.tree.get(id).kind == Kind::Places || self.is_drive(id) || id == self.tree.root {
             return;
         }
-        // The first Ctrl-click also keeps what was already selected, the way Explorer does.
+        // The first Ctrl-click also keeps what was already selected, the way Explorer does,
+        // but only from the same folder: a file left selected elsewhere isn't part of this.
         if self.acts.marked.is_empty()
             && self.tree.is_valid(self.selected)
             && self.selected != id
             && self.tree.get(self.selected).is_file()
+            && self.tree.logical_parent(self.selected) == self.tree.logical_parent(id)
         {
             self.acts.marked.push(self.selected);
         }

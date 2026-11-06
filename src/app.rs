@@ -726,9 +726,15 @@ impl App {
             self.panel_scroll.snap(0.0);
             self.text_scroll.snap(0.0);
             self.selected_row = None;
-            self.preview = None;
-            self.image_clear = true;
-            self.image_size = (0, 0);
+            // Stepping through Quick Look holds the last file until the next is ready, so the
+            // sheet never flashes empty in between.
+            let stepping = self.acts.quick.is_some() && self.tree.get(id).is_file();
+            self.acts.quick_stale = stepping;
+            if !stepping {
+                self.preview = None;
+                self.image_clear = true;
+                self.image_size = (0, 0);
+            }
             if self.tree.get(id).is_file()
                 && let Some(path) = self.tree.path_of(id)
             {
@@ -1731,6 +1737,7 @@ impl App {
                     }
                     // A slow small preview mustn't replace the large one Quick Look asked for.
                     if self.acts.quick.is_some()
+                        && !self.acts.quick_stale
                         && let (Preview::Image { width, .. }, Some(LoadedPreview { preview: Preview::Image { width: have, .. } })) =
                             (&preview, &self.preview)
                         && width < have
@@ -1743,8 +1750,15 @@ impl App {
                             self.image_size = (full_width, full_height);
                             Preview::Image { width, height, full_width, full_height, rgba: Vec::new() }
                         }
-                        other => other,
+                        other => {
+                            if self.acts.quick_stale {
+                                self.image_clear = true;
+                                self.image_size = (0, 0);
+                            }
+                            other
+                        }
                     };
+                    self.acts.quick_stale = false;
                     self.preview = Some(LoadedPreview { preview });
                 }
                 FsEvent::Facts { path, created, read_only } => {
