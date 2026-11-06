@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/vuln7/FileTree/raw/main/FileTree.exe">
+  <a href="https://github.com/vuln7/FileTree/releases/latest/download/FileTree.exe">
     <img src="https://img.shields.io/badge/Download_for_Windows-FileTree.exe-128a58?style=for-the-badge&labelColor=14205c" alt="Download FileTree.exe for Windows" height="44">
   </a>
 </p>
@@ -33,7 +33,7 @@
 </p>
 
 > [!NOTE]
-> The exe isn't signed yet, so Windows may warn you the first time. Choose **More info**, then **Run anyway**. FileTree doesn't use the internet, and your files stay on your computer.
+> The exe isn't signed yet, so Windows may warn you the first time. Choose **More info**, then **Run anyway**. FileTree doesn't use the internet, and your files stay on your computer. Every release is [built by GitHub from this public source](https://github.com/vuln7/FileTree/actions/workflows/release.yml), so you can [check your download](#check-your-download).
 
 <br>
 
@@ -161,6 +161,27 @@ It adapts to your machine by itself: your disks, your folders, your screen scali
 - Permissions, sharing, and network drives aren't covered.
 - Only zip archives can be looked inside or unpacked.
 - The download is for Windows. The code is written with macOS and Linux in mind, but they're untested.
+
+</details>
+
+<a name="check-your-download"></a>
+<details>
+<summary><b>Check your download</b></summary>
+<br>
+
+Every release on the [Releases page](https://github.com/vuln7/FileTree/releases) is compiled by a [public GitHub workflow](.github/workflows/release.yml), not on anyone's own computer.
+
+Compare the file's checksum with the SHA-256 in the release notes. In PowerShell:
+
+```powershell
+Get-FileHash FileTree.exe
+```
+
+To confirm GitHub built this exact file from this repository, use the [GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify FileTree.exe --repo vuln7/FileTree
+```
 
 </details>
 
