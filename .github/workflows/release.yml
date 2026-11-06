@@ -8,6 +8,7 @@ on:
     branches: [main]
     tags: ['v*']
     paths-ignore: ['README.md', 'docs/**']
+  workflow_dispatch:
 
 permissions:
   contents: read

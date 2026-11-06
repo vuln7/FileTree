@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/vuln7/FileTree---A-file-browser-that-is-an-actual-tree./raw/main/FileTree.exe">
+  <a href="https://github.com/vuln7/FileTree/raw/main/FileTree.exe">
     <img src="https://img.shields.io/badge/Download_for_Windows-FileTree.exe-128a58?style=for-the-badge&labelColor=14205c" alt="Download FileTree.exe for Windows" height="44">
   </a>
 </p>
