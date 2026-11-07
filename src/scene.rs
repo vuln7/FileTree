@@ -39,6 +39,8 @@ struct Walk {
     hover: NodeId,
     focus: NodeId,
     query: Vec<String>,
+    /// The wind's lean this frame, on top of every branch's own sway.
+    gust: f32,
 }
 
 impl App {
@@ -87,11 +89,17 @@ impl App {
             hover: self.hover,
             focus,
             query,
+            gust: self.gust() * (1.5 * self.scale / z).min(1.0),
         };
 
+        self.draw.sky = self.sky();
+        self.draw.scene = [self.garden.clock, self.stage()[2], self.gust(), 0.0];
+        self.draw_grass();
         let root = self.tree.root;
         let root_on_path = self.selected != NONE && self.selected != root;
         self.walk_node(&mut walk, root, [0.0, -ROOT_SINK], 0.0, 0.0, f32::INFINITY, 0, focus == NONE, root_on_path, 1.0);
+
+        self.draw_garden();
 
         // Falling petals.
         for particle in &self.particles {
@@ -135,6 +143,9 @@ impl App {
 
         let n = self.tree.get(id);
         let grow = n.grow.value.clamp(0.0, 1.2);
+        // The minimum sizes below keep distant things visible, not things on their way out:
+        // anything growing or retracting has to be able to reach nothing.
+        let presence = (grow / 0.3).min(1.0);
         let length = n.a_length.value * grow.max(0.0) * scale;
         let inner_scale = scale * n.subscale;
         let bloom = n.bloom.value;
@@ -145,7 +156,7 @@ impl App {
         // The breeze is strongest out on thin twigs.
         let flex = if is_file { 1.0 } else { (1.0 / (1.0 + weight as f32 * 0.05)).max(0.12) };
         let sway = (w.time * (0.6 + rand01(seed, 11) * 0.5) + rand01(seed, 12) * 6.28).sin() * 0.032 * flex * w.wind;
-        let heading = parent_heading + n.a_theta.value + sway;
+        let heading = parent_heading + n.a_theta.value + sway + w.gust * 0.016 * flex;
         let (sh, ch) = heading.sin_cos();
         let tip = [base[0] + sh * length, base[1] + ch * length];
         // Limbs arrive at a slight angle to their own line, so no branch looks ruled.
@@ -245,8 +256,8 @@ impl App {
             } else {
                 (2.2, 1.8)
             };
-            let width0 = (w_start * w.zoom).max(min0 * w.scale);
-            let width1 = (w_end * w.zoom).max(min1 * w.scale);
+            let width0 = (w_start * w.zoom).max(min0 * w.scale) * presence;
+            let width1 = (w_end * w.zoom).max(min1 * w.scale) * presence;
             let screen_len = length * w.zoom;
             let paper = mix_rgb(rgb(p::BRANCH), rgb(p::BRANCH_DIM), (dim * 1.4).min(1.0));
             let color = if fine { mix_rgb(paper, rgb(p::GROUND), 0.25) } else { paper };
@@ -309,14 +320,16 @@ impl App {
             let n = self.tree.get(id);
             let species = n.species().index() as f32;
             let scale_up = 1.0 + lift * 0.28;
-            let radius = FLOWER_RADIUS * scale * w.zoom * scale_up * grow.min(1.0);
+            let full = FLOWER_RADIUS * scale * w.zoom * scale_up;
+            let radius = full * grow.min(1.0);
             // A flower too small to draw as petals becomes a generous dot, so a crown of
-            // thousands reads as a mass of colour rather than as bare stems.
+            // thousands reads as a mass of colour rather than as bare stems. That's judged by
+            // its full size: one that's merely growing or shrinking is not a distant flower.
             let dot_at = 5.0 * w.scale;
-            let drawn = if radius < dot_at { radius * (1.0 + (1.0 - radius / dot_at) * 1.1) } else { radius };
+            let drawn = if full < dot_at { full * (1.0 + (1.0 - full / dot_at) * 1.1) } else { full };
             let inst = FlowerInst {
                 pos: tip_s,
-                radius: drawn.max(1.8 * w.scale),
+                radius: drawn.max(1.8 * w.scale) * grow.min(1.0),
                 rotation: rand01(seed, 7) * 6.283,
                 bloom: bloom.clamp(0.0, 1.0),
                 species,
@@ -386,7 +399,7 @@ impl App {
                 let forward = size * if drive { 0.5 } else { 0.86 };
                 let inst = FlowerInst {
                     pos: [tip_s[0] + sh * forward, tip_s[1] - ch * forward],
-                    radius: size.max(1.5 * w.scale),
+                    radius: size.max(1.5 * w.scale * presence),
                     rotation: if drive { rand01(seed, 7) * 6.283 } else { heading - std::f32::consts::FRAC_PI_2 },
                     bloom: if drive { grow.clamp(0.0, 1.0) } else { 1.0 },
                     species: if drive { p::BLOSSOM } else { p::BUD },

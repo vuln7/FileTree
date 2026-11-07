@@ -136,6 +136,23 @@ impl Spring {
         true
     }
 
+    /// Eases out toward the target: full speed the moment it's asked to move, slowing as it
+    /// arrives, with no wind-up and no overshoot. Retargeting midway carries on from where it is,
+    /// so anything can be interrupted without a jump. Returns true while still moving.
+    #[inline]
+    pub fn ease(&mut self, dt: f32, omega: f32, tolerance: f32) -> bool {
+        self.velocity = 0.0;
+        if self.value == self.target {
+            return false;
+        }
+        self.value += (self.target - self.value) * (1.0 - (-omega * dt).exp());
+        if (self.value - self.target).abs() < tolerance {
+            self.value = self.target;
+            return false;
+        }
+        true
+    }
+
     pub fn snap(&mut self, value: f32) {
         self.value = value;
         self.target = value;
@@ -796,6 +813,32 @@ pub fn display_name(path: &Path) -> String {
 
 fn child_name(path: &Path) -> String {
     display_name(path)
+}
+
+#[cfg(test)]
+mod spring_tests {
+    use super::Spring;
+
+    #[test]
+    fn easing_responds_on_the_very_first_frame() {
+        let mut s = Spring::new(0.0);
+        s.target = 1.0;
+        s.ease(1.0 / 60.0, 12.0, 0.003);
+        assert!(s.value > 0.15, "should move straight away, moved {}", s.value);
+    }
+
+    #[test]
+    fn easing_arrives_exactly_and_quickly_without_overshoot() {
+        let mut s = Spring::new(0.0);
+        s.target = 1.0;
+        let mut frames = 0;
+        while s.ease(1.0 / 60.0, 12.0, 0.003) {
+            assert!(s.value <= 1.0);
+            frames += 1;
+            assert!(frames < 60, "should be done well inside a second");
+        }
+        assert_eq!(s.value, 1.0);
+    }
 }
 
 #[cfg(test)]

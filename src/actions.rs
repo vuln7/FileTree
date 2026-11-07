@@ -3,6 +3,7 @@
 
 use crate::app::{Action, App, Key};
 use crate::audio::AudioPlayer;
+use crate::sounds::Cue;
 use crate::layout::FLOWER_RADIUS;
 use crate::ops::{self, Request, Undo};
 use crate::tree::{Kind, NONE, NodeId, Spring};
@@ -204,6 +205,13 @@ pub struct Actions {
     pub cut_nodes: rustc_hash::FxHashSet<NodeId>,
     pub clipboard: Option<arboard::Clipboard>,
     pub no_system_clipboard: bool,
+    /// When the current press began, on the same clock as `App::wall`.
+    pub press_at: f32,
+    /// The press has been held long enough that moving now carries what's under it.
+    pub armed: bool,
+    pub double_click: f32,
+    /// A click on a file in the list, which shows it unless a second click opens it instead.
+    pub pending_row: Option<(usize, f32)>,
     /// Draws a pointer into the picture, for recording. A real window has its own.
     pub film_cursor: bool,
     pub range_anchor: Option<usize>,
@@ -234,6 +242,8 @@ pub struct Actions {
     /// Hover and press animation amounts for each control.
     pub hover: rustc_hash::FxHashMap<Action, f32>,
     pub panel_in: f32,
+    /// How far down the window the panel's contents reach this frame.
+    pub panel_used: f32,
     /// Quick Look has moved on, and is still showing the last file until the next one arrives.
     pub quick_stale: bool,
     pub ui_dt: f32,
@@ -265,6 +275,9 @@ impl App {
     }
 
     pub fn toast(&mut self, text: String, undo: Option<Undo>, error: bool) {
+        if error {
+            self.sound(Cue::Knock);
+        }
         let until = self.wall + if error { 9.0 } else { 6.0 };
         // Saying the same thing twice just needs it to stay a little longer.
         if undo.is_none()
@@ -283,6 +296,14 @@ impl App {
     }
 
     pub fn start_op(&mut self, request: Request) {
+        match &request {
+            Request::Trash { .. } => self.sound(Cue::Shed),
+            Request::Undo(_) => self.sound(Cue::Regrow),
+            Request::NewFolder { .. } | Request::NewFile { .. } | Request::Extract { .. } => self.sound(Cue::Grow),
+            Request::Move { .. } | Request::Copy { .. } => self.shake_tree_for_landing(),
+            Request::Compress { .. } => self.sound(Cue::Rustle(0.3)),
+            Request::Rename { .. } => {}
+        }
         self.acts.working = Some(0.0);
         self.disk.run_op(request);
         self.redraw = true;
@@ -406,6 +427,7 @@ impl App {
     pub fn open_selected_with_flourish(&mut self) {
         let id = self.selected;
         if self.tree.is_valid(id) && self.tree.get(id).is_file() {
+            self.sound_from(Cue::Bloom(4), id);
             self.burst_petals(id);
         }
         if !self.tree.is_valid(id) {
@@ -511,6 +533,14 @@ impl App {
         } else {
             let request = Request::Copy { items, dest: dest.clone() };
             self.guarded(request, &[dest], "Copy into");
+        }
+    }
+
+    fn shake_tree_for_landing(&mut self) {
+        self.sound(Cue::Land);
+        if !self.reduced_motion {
+            self.wind.value = self.wind.value.max(2.0);
+            self.redraw = true;
         }
     }
 
@@ -718,11 +748,14 @@ impl App {
                 enabled,
             })
             .collect();
+        self.sound(Cue::Tick);
         self.acts.menu = Some(Menu { x, y, items, cursor: None, open: Spring { value: 0.0, velocity: 0.0, target: 1.0 } });
         self.redraw = true;
     }
 
     pub fn on_right_click(&mut self) {
+        self.last_input = self.wall;
+        self.sounds.warm();
         let [x, y] = self.pointer;
         self.acts.menu = None;
         let zone = self
@@ -764,6 +797,7 @@ impl App {
         if let Some(path) = self.tree.path_of(self.selected) {
             self.disk.preview_large(path);
         }
+        self.sound(Cue::Slide);
         self.acts.quick = Some(QuickLook {
             zoom: 1.0,
             pan: [0.0, 0.0],
@@ -817,6 +851,9 @@ impl App {
     // ------------------------------------------------------------ drag and drop
 
     pub fn start_drag(&mut self, id: NodeId) {
+        self.acts.armed = false;
+        let rest = self.rest_lift(id);
+        self.tree.get_mut(id).lift.target = rest;
         if !self.acts.marked.contains(&id) {
             self.clear_marks();
             self.select(id, true);
@@ -832,6 +869,7 @@ impl App {
             })
             .collect();
         self.acts.menu = None;
+        self.sound_from(Cue::Lift, id);
         self.acts.drag = Some(Drag { ids, items, flowers, target: NONE, since: self.time });
         self.redraw = true;
     }
@@ -890,6 +928,8 @@ impl App {
         let copies = self.acts.drag.as_ref().is_some_and(|d| d.target != NONE && self.drop_copies(d.target));
         let Some(drag) = self.acts.drag.take() else { return };
         if drag.target == NONE {
+            // Let go over nothing: it just settles back.
+            self.sound(Cue::Pick);
             return;
         }
         let Some(dest) = self.tree.path_of(drag.target) else { return };
@@ -1008,6 +1048,9 @@ impl App {
     }
 
     pub fn close_quick_look(&mut self) {
+        if self.acts.quick.as_ref().is_some_and(|q| q.open.target > 0.0) {
+            self.sound(Cue::Slide);
+        }
         if let Some(quick) = &mut self.acts.quick {
             quick.open.target = 0.0;
             self.redraw = true;
@@ -1212,6 +1255,29 @@ impl App {
             self.update_drag();
             moving = true;
         }
+        // Holding still on something lifts it, to show it's ready to be carried.
+        let held = self.acts.press_node;
+        if held != NONE && self.pressed_at.is_some() {
+            moving = true;
+            if !self.acts.armed && self.wall - self.acts.press_at >= crate::app::HOLD_TO_CARRY && self.tree.is_valid(held) {
+                self.acts.armed = true;
+                let reduced = self.reduced_motion;
+                let node = self.tree.get_mut(held);
+                node.lift.target = 1.0;
+                if !reduced {
+                    node.lift.velocity += 6.0;
+                }
+                self.redraw = true;
+            }
+        }
+        // A click on a file in the list shows it, once it's clear no second click is coming.
+        if let Some((row, due)) = self.acts.pending_row {
+            moving = true;
+            if self.wall >= due {
+                self.acts.pending_row = None;
+                self.activate_row(row, false);
+            }
+        }
         let now = self.wall;
         let hovered_toast = match self.hover_action {
             Action::ToastUndo(i) => Some(i),
@@ -1253,6 +1319,7 @@ impl App {
     /// What a selection change needs to refresh. Called from `select`.
     pub fn on_selection_changed(&mut self, id: NodeId) {
         self.acts.panel_in = 0.0;
+        self.acts.pending_row = None;
         self.acts.bin = None;
         self.acts.totals = None;
         self.acts.facts = None;

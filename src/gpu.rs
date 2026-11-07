@@ -73,6 +73,8 @@ struct Globals {
     ground_deep: [f32; 4],
     soil: [f32; 4],
     shadow: [f32; 4],
+    sky: [f32; 4],
+    scene: [f32; 4],
     species: [[f32; 4]; 39],
 }
 
@@ -93,12 +95,18 @@ pub struct DrawList {
     pub world_origin: [f32; 2],
     pub zoom: f32,
     pub wind: f32,
+    /// Where the sun or moon is, how dark it is, how warm the horizon is.
+    pub sky: [f32; 4],
+    /// The world's clock, the width of the stage, the gust.
+    pub scene: [f32; 4],
     /// Stems so fine they cast no shadow worth drawing.
     pub branches_fine: Vec<BranchInst>,
     /// Long limbs get more segments than short twigs.
     pub branches_long: Vec<BranchInst>,
     pub branches_short: Vec<BranchInst>,
     pub path_branches: Vec<BranchInst>,
+    /// Things far off in the world, in front of the sky and behind the tree.
+    pub backdrop: Vec<FlowerInst>,
     pub leaves: Vec<FlowerInst>,
     pub flowers: Vec<FlowerInst>,
     pub top_flowers: Vec<FlowerInst>,
@@ -113,6 +121,7 @@ impl DrawList {
         self.branches_long.clear();
         self.branches_short.clear();
         self.path_branches.clear();
+        self.backdrop.clear();
         self.leaves.clear();
         self.flowers.clear();
         self.top_flowers.clear();
@@ -180,6 +189,8 @@ enum Target {
 }
 
 pub struct Gpu {
+    /// Drawing on the processor because there's no working graphics card.
+    pub in_software: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     target: Target,
@@ -285,7 +296,9 @@ impl Gpu {
             config.present_mode = wgpu::PresentMode::AutoVsync;
             config.desired_maximum_frame_latency = 1;
             surface.configure(&device, &config);
-            return Ok(Self::build(device, queue, Target::Window { surface, config }, format));
+            let mut gpu = Self::build(device, queue, Target::Window { surface, config }, format);
+            gpu.in_software = software || adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+            return Ok(gpu);
         }
         Err(last_error)
     }
@@ -520,6 +533,7 @@ impl Gpu {
 
         let vertex = wgpu::BufferUsages::VERTEX;
         Gpu {
+            in_software: false,
             branches: GrowBuffer::new(&device, 64 * 1024, vertex),
             flowers: GrowBuffer::new(&device, 64 * 1024, vertex),
             rects: GrowBuffer::new(&device, 16 * 1024, vertex),
@@ -641,6 +655,8 @@ impl Gpu {
             ground_deep: rgb(p::GROUND_DEEP),
             soil: rgb(p::SOIL),
             shadow: rgb(p::SHADOW),
+            sky: list.sky,
+            scene: list.scene,
             species: species_palette(),
         };
         self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -654,7 +670,7 @@ impl Gpu {
         let branch_total =
             (list.branches_fine.len() + list.branches_long.len() + list.branches_short.len() + list.path_branches.len())
                 as u64;
-        let mut flower_total = (list.leaves.len() + list.flowers.len() + list.top_flowers.len()) as u64;
+        let mut flower_total = (list.backdrop.len() + list.leaves.len() + list.flowers.len() + list.top_flowers.len()) as u64;
         let mut rect_total = 0u64;
         let mut glyph_total = (list.labels.len() + list.label_halos.len()) as u64;
         for layer in &list.ui {
@@ -676,6 +692,7 @@ impl Gpu {
         let long = self.branches.push(&self.queue, &list.branches_long);
         let short = self.branches.push(&self.queue, &list.branches_short);
         let path = self.branches.push(&self.queue, &list.path_branches);
+        let backdrop = self.flowers.push(&self.queue, &list.backdrop);
         let leaves = self.flowers.push(&self.queue, &list.leaves);
         let flowers = self.flowers.push(&self.queue, &list.flowers);
         let top = self.flowers.push(&self.queue, &list.top_flowers);
@@ -722,6 +739,12 @@ impl Gpu {
 
             pass.set_pipeline(&self.ground);
             pass.draw(0..3, 0..1);
+
+            if !list.backdrop.is_empty() {
+                pass.set_vertex_buffer(0, self.flowers.buffer.slice(..));
+                pass.set_pipeline(&self.flower);
+                pass.draw(0..4, (backdrop.start / FLOWER) as u32..(backdrop.end / FLOWER) as u32);
+            }
 
             // Paper goes down in layers, thinnest first. Each layer's shadow falls on what's
             // already there, so a limb visibly lies over the twigs tucked beneath it.

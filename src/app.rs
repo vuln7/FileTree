@@ -2,6 +2,7 @@
 //! actions. It knows nothing about windows, so scripted captures and tests drive the same
 //! code the real window does.
 
+use crate::sounds::Cue;
 use crate::actions::{Actions, Cmd};
 use crate::fs::{Disk, FsEvent, Preview, SearchHit, Waker};
 use crate::gpu::DrawList;
@@ -43,6 +44,8 @@ pub enum Key {
     NewFile,
     NewFolder,
     Undo,
+    TogglePanel,
+    ToggleSound,
 }
 
 /// What the pointer should look like. The host turns this into the real thing.
@@ -81,6 +84,8 @@ pub enum Action {
     Row(usize),
     PanelScroll,
     ToggleMotion,
+    ToggleSound,
+    TogglePanel,
     Cmd(Cmd),
     MenuItem(usize),
     MenuClose,
@@ -232,6 +237,15 @@ pub struct App {
     pub drive_info: rustc_hash::FxHashMap<String, crate::platform::DriveInfo>,
     /// Everything to do with changing files: selection, clipboard, menus, dialogs.
     pub acts: Actions,
+    pub garden: crate::garden::Garden,
+    pub sounds: crate::sounds::Sounds,
+    /// When the player last touched anything, so only what they did makes a sound.
+    pub last_input: f32,
+    last_stir: f32,
+    /// How far out the side panel is: 1 showing, 0 tucked away.
+    pub panel_open: Spring,
+    /// The panel came out only to show search results, and goes back when the search ends.
+    pub panel_out_for_search: bool,
     pub cursor: Cursor,
     /// Real seconds since the start. Animation time pauses when nothing moves; this doesn't.
     pub wall: f32,
@@ -243,6 +257,13 @@ pub const TOOLBAR_H: f32 = 52.0;
 pub const PANEL_W: f32 = 340.0;
 const MIN_ZOOM_LN: f32 = -9.0;
 const MAX_ZOOM_LN: f32 = 6.5;
+/// How fast branches and the camera move to where they're going, per second. The tree and the
+/// camera share it, so they travel together rather than one chasing the other.
+const OPEN_SPEED: f32 = 10.5;
+const CLOSE_SPEED: f32 = 19.0;
+/// How long a press must rest before moving carries a file. Any quicker and it's a pan, so a
+/// click with a little slip in it can never move anything.
+pub const HOLD_TO_CARRY: f32 = 0.2;
 /// How large a small tree is drawn: big enough to fill the stage without looking blown up.
 const FIT_ZOOM: f32 = 1.45;
 
@@ -320,10 +341,17 @@ impl App {
             only_breeze: false,
             drive_info: Default::default(),
             acts: Actions::default(),
+            garden: Default::default(),
+            sounds: Default::default(),
+            last_input: -100.0,
+            last_stir: -100.0,
+            panel_open: Spring::new(1.0),
+            panel_out_for_search: false,
             cursor: Cursor::Default,
             wall: 0.0,
             press_zone: None,
         };
+        app.acts.double_click = crate::platform::double_click_seconds();
         let root = app.tree.root;
         app.tree.get_mut(root).grow.target = 1.0;
         app.expand(root);
@@ -341,9 +369,113 @@ impl App {
         TOOLBAR_H * self.scale
     }
 
-    /// The part of the window the tree can use.
+    /// The part of the window the tree can use right now, as the panel slides.
     pub fn stage(&self) -> [f32; 4] {
-        [0.0, self.toolbar_height(), (self.width - self.panel_width()).max(1.0), self.height]
+        let out = self.panel_width() * self.panel_open.value.clamp(0.0, 1.0);
+        [0.0, self.toolbar_height(), (self.width - out).max(1.0), self.height]
+    }
+
+    /// The same, once the panel has finished moving. The camera aims for this.
+    fn stage_at_rest(&self) -> [f32; 4] {
+        let out = self.panel_width() * self.panel_open.target;
+        [0.0, self.toolbar_height(), (self.width - out).max(1.0), self.height]
+    }
+
+    pub fn panel_hidden(&self) -> bool {
+        self.panel_open.target == 0.0
+    }
+
+    /// Slides the panel away or back, and lets the tree take up the new space.
+    pub fn toggle_panel(&mut self) {
+        self.sound(Cue::Slide);
+        self.panel_out_for_search = false;
+        let target = if self.panel_hidden() { 1.0 } else { 0.0 };
+        self.set_panel(target);
+    }
+
+    fn set_panel(&mut self, target: f32) {
+        self.panel_open.target = target;
+        if self.reduced_motion {
+            self.panel_open.snap(target);
+        }
+        self.labels_dirty = true;
+        self.after_layout();
+        self.wake_wind();
+    }
+
+    /// Search results live in the panel, so a search brings it out for as long as it lasts.
+    fn show_panel_for_search(&mut self) {
+        if self.panel_hidden() {
+            self.panel_out_for_search = true;
+            self.set_panel(1.0);
+        }
+    }
+
+    /// Plays a sound for something the player just did. What happens on its own, in the
+    /// background or behind another window, stays silent.
+    pub fn sound(&mut self, cue: Cue) {
+        self.sound_at(cue, 0.0, 1.0, 0.0);
+    }
+
+    /// The same, from where a node is, so it comes from that side of the tree.
+    pub fn sound_from(&mut self, cue: Cue, id: NodeId) {
+        let pan = self.pan_of(id);
+        self.sound_at(cue, pan, 1.0, 0.0);
+    }
+
+    fn pan_of(&self, id: NodeId) -> f32 {
+        if !self.tree.is_valid(id) {
+            return 0.0;
+        }
+        let stage = self.stage();
+        let x = self.camera.ox.value + self.tree.get(id).tip[0] * self.camera.zoom();
+        let half = ((stage[2] - stage[0]) * 0.5).max(1.0);
+        ((x - (stage[0] + stage[2]) * 0.5) / half).clamp(-1.0, 1.0) * 0.45
+    }
+
+    fn sound_at(&mut self, cue: Cue, pan: f32, gain: f32, delay: f32) {
+        if !self.focused || self.wall - self.last_input > 2.5 {
+            return;
+        }
+        // Stays out of the way of whatever's playing.
+        let playing = self.acts.audio.as_ref().is_some_and(|a| a.is_playing());
+        let gain = if playing { gain * 0.6 } else { gain };
+        self.sounds.play(cue, self.wall, pan, gain, delay);
+    }
+
+    /// Something touched the tree, so its leaves stir, but not every single time.
+    fn stir_leaves(&mut self) {
+        if self.wall - self.last_stir > 7.0 {
+            self.last_stir = self.wall;
+            self.sound_at(Cue::Rustle(0.12), 0.0, 1.0, 0.03);
+        }
+    }
+
+    /// A knock runs through the whole tree: it sways harder for a moment and its leaves shake.
+    pub fn shake_tree(&mut self, strength: f32) {
+        self.last_stir = self.wall;
+        self.sound_at(Cue::Rustle(strength), 0.0, 1.0, 0.02);
+        if !self.reduced_motion {
+            self.wind.value = self.wind.value.max(1.0 + strength * 2.2);
+            self.redraw = true;
+        }
+    }
+
+    pub fn toggle_sound(&mut self) {
+        self.sounds.on = !self.sounds.on;
+        if self.sounds.is_connected()
+            && let Some(marker) = crate::platform::sound_off_marker()
+        {
+            if self.sounds.on {
+                let _ = std::fs::remove_file(marker);
+            } else {
+                if let Some(folder) = marker.parent() {
+                    let _ = std::fs::create_dir_all(folder);
+                }
+                let _ = std::fs::write(marker, b"");
+            }
+        }
+        self.sound(Cue::Pick);
     }
 
     pub fn wake_wind(&mut self) {
@@ -358,11 +490,18 @@ impl App {
         if !self.tree.is_valid(id) || self.tree.get(id).is_file() {
             return;
         }
+        if !self.tree.get(id).expanded {
+            self.sound_from(Cue::Grow, id);
+        }
         self.collapsing.retain(|c| *c != id);
         let node = self.tree.get_mut(id);
         node.expanded = true;
         node.bloom.target = 1.0;
         let load = node.load;
+        // Opened again before it finished closing: its contents turn around where they are.
+        for kid in self.tree.get(id).children.clone() {
+            self.revive(kid);
+        }
         if matches!(load, Load::Unloaded | Load::Failed) {
             self.request_list(id);
         }
@@ -373,6 +512,9 @@ impl App {
     pub fn collapse(&mut self, id: NodeId) {
         if !self.tree.is_valid(id) || !self.tree.get(id).is_dir() || id == self.tree.root {
             return;
+        }
+        if self.tree.get(id).expanded {
+            self.sound_from(Cue::Close, id);
         }
         let node = self.tree.get_mut(id);
         node.expanded = false;
@@ -411,6 +553,7 @@ impl App {
 
     /// Closes every branch, back to the very start.
     pub fn reset_tree(&mut self) {
+        self.shake_tree(1.0);
         self.clear_search();
         self.pending_nav = None;
         let root = self.tree.root;
@@ -443,11 +586,36 @@ impl App {
         }
     }
 
+    /// Everything in a closing branch shrinks together, however deep, so nothing is left
+    /// standing at full size to vanish all at once.
     fn retract(&mut self, id: NodeId) {
+        let snap = self.reduced_motion;
         let node = self.tree.get_mut(id);
         node.delay = 0.0;
         node.grow.target = 0.0;
         node.bloom.target = 0.0;
+        if snap {
+            node.grow.snap(0.0);
+            node.bloom.snap(0.0);
+        }
+        for kid in self.tree.get(id).children.clone() {
+            self.retract(kid);
+        }
+    }
+
+    /// Undoes `retract`, for a branch opened again before it had finished closing.
+    fn revive(&mut self, id: NodeId) {
+        let node = self.tree.get_mut(id);
+        if node.dying {
+            return;
+        }
+        node.delay = 0.0;
+        node.grow.target = 1.0;
+        let open = node.is_file() || node.is_sprig() || node.expanded;
+        node.bloom.target = if open { 1.0 } else { 0.0 };
+        for kid in self.tree.get(id).children.clone() {
+            self.revive(kid);
+        }
     }
 
     pub fn toggle(&mut self, id: NodeId) {
@@ -529,10 +697,28 @@ impl App {
     fn awaken(&mut self, dir: NodeId) {
         let snap = self.reduced_motion;
         let count = self.tree.get(dir).children.len().max(1);
-        let step = (0.5 / count as f32).min(0.04);
+        // A quick ripple that starts at once, however many there are.
+        let step = (0.22 / count as f32).min(0.02);
         let kids = self.tree.get(dir).children.clone();
+        self.sound_blooms(dir, &kids);
         for (i, kid) in kids.iter().enumerate() {
-            self.awaken_node(*kid, 0.05 + i as f32 * step, snap);
+            self.awaken_node(*kid, i as f32 * step, snap);
+        }
+    }
+
+    /// A folder's flowers open as a small rising run: a few of them, however many there are.
+    fn sound_blooms(&mut self, dir: NodeId, kids: &[NodeId]) {
+        let flowers = kids.iter().filter(|k| self.tree.get(**k).is_file()).count();
+        let pan = self.pan_of(dir);
+        // Where the run starts changes from folder to folder.
+        let first = dir.wrapping_mul(7) % 3;
+        for i in 0..flowers.min(5) as u32 {
+            let spread = pan + (i as f32 - 2.0) * 0.05;
+            self.sound_at(Cue::Bloom(first + i), spread, 1.0 - i as f32 * 0.09, 0.06 + i as f32 * 0.062);
+        }
+        // Past a handful, a whole crown coming out is more of a rush of leaves.
+        if flowers > 12 {
+            self.sound_at(Cue::Rustle(0.55), pan, 1.0, 0.08);
         }
     }
 
@@ -559,9 +745,9 @@ impl App {
             }
             Kind::Sprig => {
                 let kids = node.children.clone();
-                let step = (0.3 / kids.len().max(1) as f32).min(0.03);
+                let step = (0.15 / kids.len().max(1) as f32).min(0.015);
                 for (i, kid) in kids.iter().enumerate() {
-                    self.awaken_node(*kid, delay + 0.08 + i as f32 * step, snap);
+                    self.awaken_node(*kid, delay + 0.03 + i as f32 * step, snap);
                 }
             }
             _ => {}
@@ -656,7 +842,7 @@ impl App {
         if b[0] > b[2] {
             return;
         }
-        let stage = self.stage();
+        let stage = self.stage_at_rest();
         let s = self.scale;
         let pad_top = 46.0 * s;
         let pad_bottom = 28.0 * s;
@@ -922,7 +1108,7 @@ impl App {
     }
 
     fn zoom_to_fit(&self, b: [f32; 4], max_zoom: f32) -> f32 {
-        let stage = self.stage();
+        let stage = self.stage_at_rest();
         let s = self.scale;
         let w = (stage[2] - stage[0] - (192.0 * s).min((stage[2] - stage[0]) * 0.22)).max(40.0);
         let h = (stage[3] - stage[1] - 74.0 * s).max(40.0);
@@ -1007,6 +1193,17 @@ impl App {
     // ------------------------------------------------------------ keyboard
 
     pub fn on_key(&mut self, key: Key) {
+        self.last_input = self.wall;
+        self.sounds.warm();
+        let before = self.selected;
+        self.handle_key(key);
+        if self.selected != before {
+            let now = self.selected;
+            self.sound_from(Cue::Pick, now);
+        }
+    }
+
+    fn handle_key(&mut self, key: Key) {
         self.wake_wind();
         if key == Key::Paste && self.acts.dialog.is_some() {
             if let Some(text) = self.system_text()
@@ -1063,7 +1260,10 @@ impl App {
             }
         }
         match key {
+            Key::TogglePanel => self.toggle_panel(),
+            Key::ToggleSound => self.toggle_sound(),
             Key::Find => {
+                self.show_panel_for_search();
                 self.search_active = true;
                 self.search_text.clear();
                 self.list_dirty = true;
@@ -1102,6 +1302,11 @@ impl App {
                 }
             }
             Key::Enter => {
+                if let Some(row) = self.selected_row {
+                    self.acts.pending_row = None;
+                    self.activate_row(row, true);
+                    return;
+                }
                 if self.selected == NONE {
                     return;
                 }
@@ -1207,6 +1412,7 @@ impl App {
     }
 
     fn search_changed(&mut self) {
+        self.show_panel_for_search();
         self.search_hits.clear();
         self.search_capped = false;
         self.labels_dirty = true;
@@ -1251,6 +1457,9 @@ impl App {
     }
 
     pub fn clear_search(&mut self) {
+        if std::mem::take(&mut self.panel_out_for_search) {
+            self.set_panel(0.0);
+        }
         self.disk.cancel_search();
         self.search_active = false;
         self.search_text.clear();
@@ -1297,7 +1506,12 @@ impl App {
                 return;
             }
             if open_it && is_dir {
-                self.expand(node);
+                self.select(node, true);
+                if !self.tree.get(node).expanded {
+                    self.expand(node);
+                    self.frame_pending(node);
+                }
+                return;
             }
             self.select(node, true);
             self.follow = false;
@@ -1329,10 +1543,17 @@ impl App {
         }
         if let Some(start) = self.pressed_at {
             let moved = ((x - start[0]).powi(2) + (y - start[1]).powi(2)).sqrt();
-            if self.acts.press_node != NONE && self.acts.drag.is_none() && moved > 6.0 * self.scale {
+            if self.acts.press_node != NONE && self.acts.drag.is_none() && moved > 8.0 * self.scale {
                 let id = self.acts.press_node;
                 self.acts.press_node = NONE;
-                self.start_drag(id);
+                if self.wall - self.acts.press_at >= HOLD_TO_CARRY {
+                    self.start_drag(id);
+                } else {
+                    // A quick swipe that happens to start on a flower just moves the view.
+                    let rest = self.rest_lift(id);
+                    self.tree.get_mut(id).lift.target = rest;
+                    self.acts.armed = false;
+                }
             }
             if self.acts.drag.is_some() {
                 self.refresh_hover();
@@ -1342,6 +1563,7 @@ impl App {
             }
             if !self.dragging
                 && self.press_zone.is_none()
+                && self.acts.press_node == NONE
                 && moved > 4.0 * self.scale
                 && start[0] < self.stage()[2]
                 && start[1] > self.stage()[1]
@@ -1398,7 +1620,7 @@ impl App {
             } else {
                 Cursor::Grabbing
             }
-        } else if self.dragging {
+        } else if self.dragging || self.acts.armed {
             Cursor::Grabbing
         } else if matches!(action, Action::SearchField) {
             Cursor::Text
@@ -1434,8 +1656,12 @@ impl App {
     }
 
     pub fn on_pointer_down(&mut self) {
+        self.last_input = self.wall;
+        self.sounds.warm();
         self.pressed_at = Some(self.pointer);
         self.dragging = false;
+        self.acts.press_at = self.wall;
+        self.acts.armed = false;
         let [x, y] = self.pointer;
         let zone = self.zones.iter().rev().find(|z| inside(z.rect, x, y)).map(|z| z.action);
         self.press_zone = zone;
@@ -1465,12 +1691,17 @@ impl App {
     }
 
     pub fn on_pointer_up(&mut self) {
+        self.last_input = self.wall;
         let was_drag = self.dragging || self.scrolling;
         let press_zone = self.press_zone.take();
         self.pressed_at = None;
         self.dragging = false;
         self.scrolling = false;
-        self.acts.press_node = NONE;
+        let released = std::mem::replace(&mut self.acts.press_node, NONE);
+        if std::mem::take(&mut self.acts.armed) && self.tree.is_valid(released) {
+            let rest = self.rest_lift(released);
+            self.tree.get_mut(released).lift.target = rest;
+        }
         if self.acts.drag.is_some() {
             self.finish_drag();
             self.wake_wind();
@@ -1503,26 +1734,23 @@ impl App {
             self.frame_node(hit);
             return;
         }
+        self.sound_from(Cue::Pick, hit);
+        self.stir_leaves();
         if self.acts.ctrl {
             self.toggle_mark(hit);
             return;
         }
         self.clear_marks();
-        let double = self.last_click.1 == hit && self.time - self.last_click.0 < 0.38;
-        self.last_click = (self.time, hit);
-        if self.tree.get(hit).is_file() {
-            self.select(hit, true);
-            if double {
+        // One click selects, two open, the same as in Explorer.
+        let double = self.last_click.1 == hit && self.wall - self.last_click.0 < self.acts.double_click;
+        // Three quick clicks are a double and a single, not two doubles.
+        self.last_click = if double { (-10.0, NONE) } else { (self.wall, hit) };
+        self.select(hit, true);
+        if double {
+            if self.tree.get(hit).is_file() {
                 self.open_selected_with_flourish();
-            }
-        } else {
-            let was_selected = self.selected == hit;
-            self.select(hit, true);
-            if !self.tree.get(hit).expanded {
-                self.expand(hit);
-                self.frame_pending(hit);
-            } else if was_selected && hit != self.tree.root {
-                self.collapse(hit);
+            } else {
+                self.toggle_branch(hit);
             }
         }
     }
@@ -1554,12 +1782,17 @@ impl App {
 
     pub fn on_action(&mut self, action: Action) {
         self.wake_wind();
+        if !matches!(action, Action::ToggleSound | Action::MenuClose | Action::PanelScroll | Action::AudioSeek) {
+            self.sound(Cue::Tick);
+        }
         match action {
             Action::Back => self.go_back(),
             Action::Forward => self.go_forward(),
             Action::Up => self.go_up(),
             Action::Crumb(index) => self.go_crumb(index),
+            Action::TogglePanel => self.toggle_panel(),
             Action::SearchField => {
+                self.show_panel_for_search();
                 self.search_active = true;
                 self.list_dirty = true;
             }
@@ -1603,6 +1836,7 @@ impl App {
             Action::AudioSeek | Action::QuickContent => {}
             Action::ToggleHidden => self.toggle_hidden(),
             Action::ToggleMotion => self.toggle_motion(),
+            Action::ToggleSound => self.toggle_sound(),
             Action::Fit => {
                 self.follow = true;
                 self.fit_all(false);
@@ -1625,10 +1859,17 @@ impl App {
             Action::Row(row) => {
                 self.clear_marks();
                 self.acts.range_anchor = Some(row);
-                let double = self.last_row_click.1 == row && self.time - self.last_row_click.0 < 0.38;
-                self.last_row_click = (self.time, row);
+                self.acts.pending_row = None;
+                let double = self.last_row_click.1 == row && self.wall - self.last_row_click.0 < self.acts.double_click;
+                self.last_row_click = if double { (-10.0, usize::MAX) } else { (self.wall, row) };
                 self.selected_row = Some(row);
-                self.activate_row(row, double);
+                if double {
+                    self.activate_row(row, true);
+                } else if self.list.get(row).is_some_and(|item| !item.is_dir) {
+                    // The list has to stay put for a second click to land on the same row, so a
+                    // file's preview waits until it's clear this was only one click.
+                    self.acts.pending_row = Some((row, self.wall + self.acts.double_click));
+                }
             }
             Action::PanelScroll | Action::Nothing => {}
         }
@@ -1819,20 +2060,28 @@ impl App {
             moving = true;
         }
 
-        // Stillness is a feature: the breeze dies down soon after the last interaction.
+        // A touch stirs the tree. The breeze then settles to the world's own gentle one, and
+        // dies away completely once nobody's here.
         self.idle_for += dt;
-        if self.idle_for > 3.0 || !self.focused || self.reduced_motion {
-            self.wind.target = 0.0;
-        }
+        self.wind.target = if !self.focused || self.reduced_motion || self.idle_for > crate::garden::REST_AFTER {
+            0.0
+        } else if self.idle_for > 3.0 {
+            0.55
+        } else {
+            1.0
+        };
         let breeze = self.wind.step(dt, 2.2);
+        let breeze = self.step_garden(dt) || breeze;
 
         let mut layout = false;
-        layout |= self.camera.ox.step_within(dt, 9.0, 0.05);
-        layout |= self.camera.oy.step_within(dt, 9.0, 0.05);
-        layout |= self.camera.log_zoom.step(dt, 9.0);
+        layout |= self.camera.ox.ease(dt, OPEN_SPEED, 0.05);
+        layout |= self.camera.oy.ease(dt, OPEN_SPEED, 0.05);
+        layout |= self.camera.log_zoom.ease(dt, OPEN_SPEED, 0.0004);
         moving |= self.panel_scroll.step(dt, 22.0);
         moving |= self.text_scroll.step(dt, 22.0);
         moving |= self.step_overlays(dt);
+        let panel_moving = self.panel_open.ease(dt, 15.0, 0.001);
+        moving |= panel_moving;
 
         for node in &mut self.tree.nodes {
             if !node.alive {
@@ -1843,18 +2092,26 @@ impl App {
                 layout = true;
                 continue;
             }
-            let grow_speed = if node.is_file() { 9.0 } else { 6.5 };
-            let bloom_speed = if node.is_file() { 3.2 } else { 7.0 };
-            layout |= node.grow.step(dt, grow_speed);
+            // Closing is quicker than opening: once it's been dismissed, it should just go.
+            let closing = node.grow.target == 0.0;
+            let grow_speed = if closing { CLOSE_SPEED } else if node.is_file() { 13.0 } else { OPEN_SPEED };
+            let bloom_speed = if node.bloom.target == 0.0 {
+                CLOSE_SPEED
+            } else if node.is_file() {
+                6.5
+            } else {
+                16.0
+            };
+            layout |= node.grow.ease(dt, grow_speed, 0.003);
             // A flower can't open until its stalk has reached out.
             if !node.is_file() || node.grow.value > 0.45 || node.bloom.target == 0.0 {
-                moving |= node.bloom.step(dt, bloom_speed);
+                moving |= node.bloom.ease(dt, bloom_speed, 0.006);
             } else if node.bloom.target != node.bloom.value {
                 moving = true;
             }
             moving |= node.lift.step(dt, 18.0);
-            layout |= node.a_theta.step(dt, 8.0);
-            layout |= node.a_length.step_within(dt, 8.0, 0.05);
+            layout |= node.a_theta.ease(dt, OPEN_SPEED, 0.0012);
+            layout |= node.a_length.ease(dt, OPEN_SPEED, 0.05);
         }
 
         if !self.particles.is_empty() {
@@ -1870,7 +2127,7 @@ impl App {
             moving = true;
         }
 
-        self.layout_moving = layout;
+        self.layout_moving = layout || panel_moving;
         moving |= layout;
         self.finish_retractions();
         self.only_breeze = breeze && !moving;
@@ -1996,6 +2253,256 @@ pub fn home_dir_string() -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A throwaway folder with one subfolder and one file, opened in the app and read, with
+    /// both placed where the pointer can reach them.
+    fn clickable_app(tag: &str) -> (App, PathBuf, NodeId, NodeId) {
+        let dir = std::env::temp_dir().join(format!("filetree-click-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::write(dir.join("note.txt"), "hello").unwrap();
+        let waker: Waker = Arc::new(|| {});
+        let mut app = App::new(Some(dir.clone()), waker, 1440.0, 900.0, 1.0);
+        for _ in 0..500 {
+            app.pump_events();
+            if app.find_by_name("folder") != NONE && app.find_by_name("note.txt") != NONE {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (folder, file) = (app.find_by_name("folder"), app.find_by_name("note.txt"));
+        assert!(folder != NONE && file != NONE, "the folder was never read");
+        app.visible.push(Visible { id: folder, x: 100.0, y: 100.0, r: 20.0, rank: 1 });
+        app.visible.push(Visible { id: file, x: 300.0, y: 100.0, r: 20.0, rank: 0 });
+        app.acts.double_click = 0.5;
+        app.wall = 10.0;
+        (app, dir, folder, file)
+    }
+
+    fn click_at(app: &mut App, x: f32, y: f32) {
+        app.on_pointer_move(x, y);
+        app.on_pointer_down();
+        app.on_pointer_up();
+    }
+
+    #[test]
+    fn one_click_selects_a_folder_and_two_open_it() {
+        let (mut app, dir, folder, _) = clickable_app("double");
+        click_at(&mut app, 100.0, 100.0);
+        assert_eq!(app.selected, folder);
+        assert!(!app.tree.get(folder).expanded, "one click must not open a folder");
+        app.wall += 0.2;
+        click_at(&mut app, 100.0, 100.0);
+        assert!(app.tree.get(folder).expanded, "two quick clicks open it");
+        app.wall += 0.2;
+        click_at(&mut app, 100.0, 100.0);
+        assert!(app.tree.get(folder).expanded, "a third click is a new first click");
+        app.wall += 0.2;
+        click_at(&mut app, 100.0, 100.0);
+        assert!(!app.tree.get(folder).expanded, "double-clicking an open folder closes it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_slow_clicks_are_not_a_double_click() {
+        let (mut app, dir, folder, _) = clickable_app("slow");
+        click_at(&mut app, 100.0, 100.0);
+        app.wall += 0.9;
+        click_at(&mut app, 100.0, 100.0);
+        assert!(!app.tree.get(folder).expanded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clicks_on_two_different_things_are_not_a_double_click() {
+        let (mut app, dir, folder, file) = clickable_app("different");
+        click_at(&mut app, 300.0, 100.0);
+        assert_eq!(app.selected, file);
+        app.wall += 0.1;
+        click_at(&mut app, 100.0, 100.0);
+        assert_eq!(app.selected, folder);
+        assert!(!app.tree.get(folder).expanded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_quick_swipe_from_a_flower_never_picks_it_up() {
+        let (mut app, dir, _, _) = clickable_app("swipe");
+        app.on_pointer_move(300.0, 100.0);
+        app.on_pointer_down();
+        app.wall += 0.05;
+        app.on_pointer_move(340.0, 100.0);
+        assert!(app.acts.drag.is_none(), "a quick swipe must not start a drag");
+        assert!(app.dragging, "it pans the view instead");
+        app.on_pointer_up();
+        assert!(app.acts.drag.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn holding_then_moving_picks_a_flower_up() {
+        let (mut app, dir, _, _) = clickable_app("hold");
+        app.on_pointer_move(300.0, 100.0);
+        app.on_pointer_down();
+        app.wall += HOLD_TO_CARRY + 0.05;
+        app.on_pointer_move(340.0, 100.0);
+        assert!(app.acts.drag.is_some(), "a deliberate hold starts a drag");
+        app.on_key(Key::Escape);
+        assert!(app.acts.drag.is_none(), "and Esc puts it back");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_small_slip_during_a_click_still_counts_as_a_click() {
+        let (mut app, dir, _, file) = clickable_app("slip");
+        app.on_pointer_move(300.0, 100.0);
+        app.on_pointer_down();
+        app.on_pointer_move(304.0, 102.0);
+        app.on_pointer_up();
+        assert!(app.acts.drag.is_none());
+        assert_eq!(app.selected, file);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hiding_the_panel_gives_its_space_to_the_tree() {
+        let waker: Waker = Arc::new(|| {});
+        let mut app = App::new(None, waker, 1440.0, 900.0, 1.0);
+        assert_eq!(app.stage()[2], 1440.0 - PANEL_W);
+        app.toggle_panel();
+        for _ in 0..240 {
+            app.tick(1.0 / 60.0);
+        }
+        assert_eq!(app.stage()[2], 1440.0, "the tree gets the whole window");
+        app.toggle_panel();
+        for _ in 0..240 {
+            app.tick(1.0 / 60.0);
+        }
+        assert_eq!(app.stage()[2], 1440.0 - PANEL_W, "and gives it back");
+    }
+
+    #[test]
+    fn a_search_brings_the_panel_out_only_while_it_lasts() {
+        let waker: Waker = Arc::new(|| {});
+        let mut app = App::new(None, waker, 1440.0, 900.0, 1.0);
+        app.toggle_panel();
+        assert!(app.panel_hidden());
+        app.on_char('a');
+        assert!(!app.panel_hidden(), "results need somewhere to show");
+        app.clear_search();
+        assert!(app.panel_hidden(), "it tucks away again afterwards");
+
+        // If it was already showing, ending a search leaves it alone.
+        app.toggle_panel();
+        app.on_char('a');
+        app.clear_search();
+        assert!(!app.panel_hidden());
+    }
+
+    #[test]
+    fn closing_shrinks_a_whole_branch_together_and_reopening_turns_it_around() {
+        let dir = std::env::temp_dir().join(format!("filetree-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outer").join("inner")).unwrap();
+        std::fs::write(dir.join("outer").join("inner").join("deep.txt"), "x").unwrap();
+        let waker: Waker = Arc::new(|| {});
+        let mut app = App::new(Some(dir.clone()), waker, 1440.0, 900.0, 1.0);
+        let wait_for = |app: &mut App, name: &str| {
+            for _ in 0..500 {
+                app.pump_events();
+                let id = app.find_by_name(name);
+                if id != NONE {
+                    return id;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("{name} never appeared");
+        };
+        let outer = wait_for(&mut app, "outer");
+        app.expand(outer);
+        let inner = wait_for(&mut app, "inner");
+        app.expand(inner);
+        let deep = wait_for(&mut app, "deep.txt");
+        for _ in 0..120 {
+            app.tick(1.0 / 60.0);
+        }
+        assert_eq!(app.tree.get(deep).grow.value, 1.0);
+
+        app.collapse(outer);
+        app.tick(1.0 / 60.0);
+        assert_eq!(app.tree.get(deep).grow.target, 0.0, "the deepest file closes with the branch");
+        assert!(app.tree.get(deep).grow.value < 1.0, "and starts straight away");
+
+        app.expand(outer);
+        assert_eq!(app.tree.get(inner).grow.target, 1.0, "reopening turns it around");
+        assert_eq!(app.tree.get(deep).grow.target, 1.0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_a_folder_sounds_like_growing_and_blooming_and_only_when_you_did_it() {
+        let dir = std::env::temp_dir().join(format!("filetree-sounds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("outer")).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join("outer").join(name), "x").unwrap();
+        }
+        let waker: Waker = Arc::new(|| {});
+        let mut app = App::new(Some(dir.clone()), waker, 1440.0, 900.0, 1.0);
+        let wait_for = |app: &mut App, name: &str| {
+            for _ in 0..500 {
+                app.pump_events();
+                let id = app.find_by_name(name);
+                if id != NONE {
+                    return id;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("{name} never appeared");
+        };
+        let outer = wait_for(&mut app, "outer");
+        assert!(app.sounds.heard.is_empty(), "the tree appearing by itself makes no sound");
+
+        app.wall = 10.0;
+        app.last_input = 10.0;
+        app.expand(outer);
+        assert_eq!(app.sounds.heard, vec![Cue::Grow]);
+        wait_for(&mut app, "c.txt");
+        assert_eq!(app.sounds.heard.iter().filter(|c| matches!(c, Cue::Bloom(_))).count(), 3, "{:?}", app.sounds.heard);
+
+        app.wall = 11.0;
+        app.last_input = 11.0;
+        app.sounds.heard.clear();
+        app.collapse(outer);
+        assert_eq!(app.sounds.heard, vec![Cue::Close]);
+
+        // Long after anything was touched, or behind another window, it's quiet.
+        app.sounds.heard.clear();
+        app.wall = 30.0;
+        app.expand(outer);
+        assert!(app.sounds.heard.is_empty());
+        app.collapse(outer);
+        app.last_input = 30.0;
+        app.focused = false;
+        app.expand(outer);
+        assert!(app.sounds.heard.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shaking_the_tree_makes_it_sway_harder_for_a_moment() {
+        let waker: Waker = Arc::new(|| {});
+        let mut app = App::new(None, waker, 1440.0, 900.0, 1.0);
+        app.wall = 5.0;
+        app.last_input = 5.0;
+        app.shake_tree(1.0);
+        assert!(app.wind.value > 2.0);
+        assert!(matches!(app.sounds.heard[0], Cue::Rustle(_)));
+        for _ in 0..240 {
+            app.tick(1.0 / 60.0);
+        }
+        assert!(app.wind.value <= 1.05, "and it settles down again, at {}", app.wind.value);
+    }
 
     /// Framing a tiny target past the zoom limit must still centre it.
     #[test]

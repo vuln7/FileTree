@@ -12,6 +12,10 @@ struct Globals {
     ground_deep: vec4f,
     soil: vec4f,
     shadow: vec4f,
+    // Sun or moon x and y as fractions of the stage, how dark it is, how warm the horizon is.
+    sky: vec4f,
+    // The world's clock, the width of the stage, the gust, unused.
+    scene: vec4f,
     // Outer petal, inner petal, and centre colours for each species.
     species: array<vec4f, 39>,
 }
@@ -59,6 +63,108 @@ fn vs_ground(@builtin(vertex_index) vi: u32) -> GroundOut {
     return out;
 }
 
+// How the light of the hour falls on paper: a cool, deep blue through the night.
+fn daylight(col: vec3f) -> vec3f {
+    return col * mix(vec3f(1.0), vec3f(0.52, 0.58, 0.78), g.sky.z);
+}
+
+const CREAM_LIGHT = vec3f(1.0, 0.965, 0.89);
+const HORIZON_WARM = vec3f(0.95, 0.47, 0.33);
+
+// Small four-point stars cut from paper, which show at night and slowly brighten and fade.
+fn star_cover(p: vec2f) -> f32 {
+    if (g.sky.z < 0.01) { return 0.0; }
+    let size = 54.0 * g.scale;
+    let q = (p + vec2f(g.world_origin.x * 0.012, 0.0)) / size;
+    let cell = floor(q);
+    let pick = hash21(cell + 3.1);
+    if (pick < 0.58) { return 0.0; }
+    let spot = (vec2f(hash21(cell + 1.7), hash21(cell + 5.3)) - 0.5) * 0.7;
+    let d = abs(fract(q) - 0.5 - spot) * size;
+    let twinkle = 0.72 + 0.28 * sin(g.scene.x * (0.8 + pick * 1.6) + pick * 40.0);
+    let radius = (1.3 + (pick - 0.58) * 6.0) * g.scale * twinkle;
+    // Concave sides, so it reads as a star rather than a diamond.
+    let shape = sqrt(d.x) + sqrt(d.y) - sqrt(radius);
+    return clamp(-shape * 3.0 + 0.5, 0.0, 1.0) * g.sky.z;
+}
+
+// One layer of paper clouds, repeating across the sky. The distance to its edge, in pixels.
+fn cloud_edge(p: vec2f, width: f32, speed: f32, seed: f32) -> f32 {
+    let x = p.x + g.scene.x * speed * g.scale + g.world_origin.x * 0.02 + seed * 311.0;
+    let cell = floor(x / width);
+    let some = hash21(vec2f(cell + 0.5, seed));
+    if (some < 0.28) { return 1e5; }
+    let size = width * (0.062 + 0.058 * hash21(vec2f(cell + 0.5, seed + 1.1)));
+    let centre = vec2f(
+        (cell + 0.5 + (hash21(vec2f(cell + 0.5, seed + 2.3)) - 0.5) * 0.34) * width,
+        g.viewport.y * (0.14 + 0.32 * hash21(vec2f(cell + 0.5, seed + 3.7))),
+    );
+    // Stretched wide, as clouds lie on the sky.
+    let q = (vec2f(x, p.y) - centre) / size * vec2f(0.8, 1.45);
+    var d = min(length(q - vec2f(-0.62, 0.03)) - 0.38, length(q - vec2f(-0.16, -0.24)) - 0.58);
+    d = min(d, length(q - vec2f(0.34, -0.14)) - 0.48);
+    d = min(d, length(q - vec2f(0.78, 0.05)) - 0.31);
+    // Scissors across the bottom, and a slightly unsteady hand all round.
+    d = max(d, q.y - 0.27);
+    d += sin(q.x * 8.0 + some * 30.0) * 0.012 + sin(q.y * 11.0 + some * 17.0) * 0.012;
+    return d * size * 0.8;
+}
+
+fn lay_cloud(col: vec3f, p: vec2f, width: f32, speed: f32, seed: f32, tone: f32) -> vec3f {
+    let shadow_d = cloud_edge(p - vec2f(2.0, 5.0) * g.scale, width, speed, seed);
+    let out = mix(col, g.shadow.rgb, smoothstep(5.0 * g.scale, -2.0 * g.scale, shadow_d) * 0.14);
+    let d = cloud_edge(p, width, speed, seed);
+    // Paper a shade paler than the sky behind it, not white laid over blue.
+    let paper_col = mix(col, daylight(vec3f(0.74, 0.83, 1.0)), tone);
+    return mix(out, paper_col, clamp(0.5 - d, 0.0, 1.0));
+}
+
+// The sun by day and a crescent moon by night, each a plain disc of paper on larger, paler discs.
+fn lay_light(col: vec3f, p: vec2f) -> vec3f {
+    let centre = vec2f(g.scene.y * g.sky.x + g.world_origin.x * 0.006, g.viewport.y * g.sky.y);
+    // Smaller in a small window, where it would otherwise crowd the tree.
+    let radius = 40.0 * g.scale * clamp(g.scene.y / (900.0 * g.scale), 0.6, 1.0);
+    let to = p - centre;
+    let r = length(to);
+    if (r > radius * 2.1) { return col; }
+    let wobble = sin(atan2(to.y, to.x) * 7.0 + 1.0) * 0.32 * g.scale;
+    let moon = g.sky.z > 0.5;
+    let warm = g.sky.w;
+    let body = select(mix(vec3f(1.0, 0.9, 0.62), vec3f(1.0, 0.66, 0.38), warm), vec3f(0.97, 0.95, 0.86), moon);
+    var out = col;
+    out = mix(out, mix(col, body, 0.055), clamp(radius * 1.9 + wobble - r + 0.5, 0.0, 1.0));
+    out = mix(out, mix(col, body, 0.10), clamp(radius * 1.38 - wobble - r + 0.5, 0.0, 1.0));
+    var cover = clamp(radius + wobble - r + 0.5, 0.0, 1.0);
+    if (moon) {
+        cover *= clamp(length(to - vec2f(radius * 0.46, -radius * 0.2)) - radius * 0.88 + 0.5, 0.0, 1.0);
+    }
+    return mix(out, body, cover);
+}
+
+// A distant hill's cut edge on screen. Further hills move less with the camera and scale less
+// with the zoom, which is what makes them look far away.
+fn hill_edge(x: f32, i: f32) -> f32 {
+    let depth = 0.2 + i * 0.22;
+    let size = clamp(pow(g.zoom / g.scale, 0.4), 0.55, 1.7) * g.scale;
+    let wx = (x - g.world_origin.x * depth) / size;
+    let tall = 112.0 - i * 34.0;
+    let wave = sin(wx * 0.0042 + i * 2.1) * 0.62 + sin(wx * 0.0112 + i * 4.3) * 0.28 + sin(wx * 0.029 + i) * 0.1;
+    var height = tall + wave * tall * 0.3;
+    // A line of small conifers along the middle ridge, in clumps.
+    if (i > 0.5 && i < 1.5) {
+        let spacing = 17.0;
+        let cell = floor(wx / spacing);
+        let clump = value_noise(vec2f(cell * 0.09, 4.0));
+        if (clump > 0.52) {
+            let t = abs(fract(wx / spacing) - 0.5) * 2.0;
+            height += (1.0 - t) * (8.0 + 11.0 * hash21(vec2f(cell + 0.5, 9.0))) * smoothstep(0.52, 0.6, clump);
+        }
+    }
+    // Slower than the ground as the camera moves, but never sunk below where the land begins.
+    let foot = min(mix(g.viewport.y, g.world_origin.y, depth), g.world_origin.y);
+    return foot - height * size;
+}
+
 @fragment
 fn fs_ground(in: GroundOut) -> @location(0) vec4f {
     let p = in.pos.xy;
@@ -68,13 +174,39 @@ fn fs_ground(in: GroundOut) -> @location(0) vec4f {
     let stroke = smoothstep(0.32, 0.68, streak * 0.62 + streak2 * 0.38);
     var col = mix(g.ground.rgb, g.ground_deep.rgb, stroke * 0.42);
 
+    // Deeper overhead, paler toward the ground, and warm along the horizon at either end of
+    // the day.
+    let down = clamp(p.y / g.viewport.y, 0.0, 1.0);
+    col *= 0.84 + 0.22 * down;
+    col = daylight(col);
+    let warm = g.sky.w * smoothstep(0.3, 1.0, down);
+    col = mix(col, HORIZON_WARM, warm * warm * 0.46);
+
+    col = mix(col, daylight(CREAM_LIGHT) * 1.4, star_cover(p));
+    col = lay_light(col, p);
+    col = lay_cloud(col, p, 620.0 * g.scale, 4.0, 2.0, 0.16);
+    col = lay_cloud(col, p, 900.0 * g.scale, 8.0, 5.0, 0.28);
+
+    // Hills, far to near, each a cut sheet casting a shadow on the one behind it.
+    for (var i = 0.0; i < 2.5; i += 1.0) {
+        let edge = hill_edge(p.x, i);
+        let d = p.y - edge;
+        if (d > -8.0 * g.scale) {
+            let drop = clamp(1.0 + d / (7.0 * g.scale), 0.0, 1.0);
+            col = mix(col, g.shadow.rgb, drop * drop * 0.26 * step(d, 0.0));
+            let tone = mix(mix(g.ground.rgb, g.soil.rgb, 0.2 + i * 0.2), g.shadow.rgb, 0.1 + i * 0.07);
+            let face = daylight(tone * (0.96 + value_noise(p * vec2f(0.012, 0.05) / g.scale + i * 7.0) * 0.08));
+            col = mix(col, mix(face, HORIZON_WARM, g.sky.w * (0.16 - i * 0.05)), clamp(d + 0.5, 0.0, 1.0));
+        }
+    }
+
     // The back layer of soil, cut with a wandering edge, its shadow falling on the field.
     let d = p.y - soil_edge(p.x, 0.0);
     let drop = clamp(1.0 + d / (9.0 * g.scale), 0.0, 1.0);
     col = mix(col, g.shadow.rgb, drop * drop * 0.42 * step(d, 0.0));
     let soil = clamp(d + 0.5, 0.0, 1.0);
     let soil_streak = value_noise(p * vec2f(0.01, 0.04) / g.scale + 19.0);
-    col = mix(col, g.soil.rgb * (0.82 + soil_streak * 0.07), soil);
+    col = mix(col, daylight(g.soil.rgb * (0.82 + soil_streak * 0.07)), soil);
     return vec4f(paper(col, p), 1.0);
 }
 
@@ -97,7 +229,21 @@ fn fs_soil_front(in: GroundOut) -> @location(0) vec4f {
     let drop = clamp(1.0 + d / (8.0 * g.scale), 0.0, 1.0);
     let shadow_a = drop * drop * 0.38 * (1.0 - cover);
     let streak = value_noise(p * vec2f(0.012, 0.05) / g.scale + 31.0);
-    let col = paper(g.soil.rgb * (1.04 + streak * 0.06), p);
+    var earth = g.soil.rgb * (1.04 + streak * 0.06);
+    // Further sheets of soil, each lower and darker than the last, all the way down.
+    var band = 3.5;
+    var tone = 0.93;
+    for (var i = 0; i < 5; i += 1) {
+        let below = p.y - soil_edge(p.x, band);
+        if (below < -9.0 * g.scale) { break; }
+        let fall = clamp(1.0 + below / (7.0 * g.scale), 0.0, 1.0);
+        earth = mix(earth, g.shadow.rgb, fall * fall * 0.24 * step(below, 0.0));
+        let sheet = g.soil.rgb * tone * (0.98 + value_noise(p * vec2f(0.012, 0.05) / g.scale + 31.0 + band) * 0.06);
+        earth = mix(earth, sheet, clamp(below + 0.5, 0.0, 1.0));
+        band *= 1.9;
+        tone *= 0.93;
+    }
+    let col = paper(daylight(earth), p);
     let rgb = col * cover + g.shadow.rgb * shadow_a;
     return vec4f(rgb, cover + shadow_a);
 }
@@ -284,6 +430,14 @@ fn petal(p: vec2f, len: f32, width: f32, point: f32, ruffle: f32, seed: f32) -> 
     return (profile + hand) * width * len - abs(p.y);
 }
 
+// One wing of a butterfly in unfolded coordinates, with its root on the body: 1 upper, 2 lower.
+fn butterfly_wing(w: vec2f, which: f32) -> f32 {
+    if (which < 1.5) {
+        return petal(rot2(w, 0.76), 1.06, 0.5, 0.1, 0.035, 2.0);
+    }
+    return petal(rot2(w, 2.22), 0.78, 0.56, 0.0, 0.04, 5.0);
+}
+
 fn stagger(bloom: f32, i: f32, n: f32) -> f32 {
     // Petals unfold one after another around the flower.
     let span = 0.55;
@@ -326,7 +480,7 @@ fn fs_flower(in: FlowerOut) -> @location(0) vec4f {
     let px = 1.0 / max(in.radius, 0.01);
     let s = in.species;
     // A shed petal borrows the colour of the flower it fell from, given in its seed.
-    let palette = select(s, u32(in.seed) % 9u, s == 11u);
+    let palette = select(s, u32(in.seed) % 9u, s == 11u || s == 13u || s == 14u);
     let c_outer = g.species[palette * 3u].rgb;
     let c_inner = g.species[palette * 3u + 1u].rgb;
     let c_core = g.species[palette * 3u + 2u].rgb;
@@ -347,6 +501,52 @@ fn fs_flower(in: FlowerOut) -> @location(0) vec4f {
 
     var col: vec3f;
     var alpha = 0.0;
+
+    if (s == 13u) {
+        // A butterfly seen from above, facing along +x. Its bloom is how far its wings are open,
+        // so a flap narrows them across the body rather than shrinking them.
+        let q = rot2(in.uv, in.rotation);
+        let qs = rot2(in.uv - shadow_shift, in.rotation);
+        let open = max(in.bloom, 0.14);
+        let w = vec2f(q.x, abs(q.y) / open);
+        let shape = max(butterfly_wing(w, 1.0), butterfly_wing(w, 2.0)) * open;
+        let ws = vec2f(qs.x, abs(qs.y) / open);
+        let shape_s = max(butterfly_wing(ws, 1.0), butterfly_wing(ws, 2.0)) * open;
+        let cover = clamp(shape / px + 0.5, 0.0, 1.0);
+        let shadow_a = clamp(shape_s / shadow_soft + 0.5, 0.0, 1.0) * 0.3;
+
+        // A paler sheet on each wing, then a spot near the tip of the upper one.
+        var wing = mix(c_outer * 0.8, c_outer, smoothstep(0.1, 0.32, length(w)));
+        let sheet = max(butterfly_wing((w - vec2f(0.1, 0.17)) / 0.62, 1.0), butterfly_wing((w - vec2f(-0.08, 0.14)) / 0.6, 2.0)) * 0.6 * open;
+        wing = mix(wing, c_inner, clamp(sheet / px + 0.5, 0.0, 1.0));
+        let spot = (0.095 - length(w - vec2f(0.56, 0.55))) * open;
+        wing = mix(wing, c_core, clamp(spot / px + 0.5, 0.0, 1.0));
+
+        // The body and two feelers, on top of the wings.
+        let along_body = clamp(q.x, -0.46, 0.3);
+        let thick = 0.05 + 0.03 * smoothstep(-0.46, 0.2, q.x);
+        let body = thick - length(q - vec2f(along_body, 0.0));
+        let feeler_at = vec2f(q.x - 0.3, abs(q.y));
+        let feeler_on = clamp(dot(feeler_at, vec2f(0.82, 0.57)), 0.0, 0.34);
+        let feeler = 0.024 - length(feeler_at - vec2f(0.82, 0.57) * feeler_on);
+        let dark = clamp(max(body, feeler) / px + 0.5, 0.0, 1.0);
+        let all = max(cover, dark);
+        let rgb = mix(paper(wing, in.screen), paper(vec3f(0.08, 0.1, 0.26), in.screen), dark);
+        return vec4f(rgb * all + g.shadow.rgb * shadow_a * (1.0 - all), all + shadow_a * (1.0 - all));
+    }
+
+    if (s == 14u) {
+        // A distant bird: one small cut of paper, two wings swept out from the body. Its bloom
+        // is where they are in the beat, from held low to raised.
+        let q = rot2(in.uv, in.rotation);
+        let x = min(abs(q.x), 1.0);
+        let rise = mix(0.3, -0.52, in.bloom) * x * (0.6 + 0.4 * x);
+        let thick = 0.135 * pow(max(1.0 - x, 0.0), 0.72) * (0.55 + 0.45 * min(x * 4.0, 1.0));
+        let wing = thick - abs(q.y - rise + 0.03 * sign(q.x) * x);
+        let head = 0.11 - length(q * vec2f(1.0, 1.2));
+        let cover = clamp(max(wing, head) / px + 0.5, 0.0, 1.0);
+        return vec4f(paper(daylight(c_outer), in.screen), 1.0) * cover;
+    }
 
     if (s == 11u) {
         let q = rot2(in.uv, in.rotation);
@@ -495,8 +695,13 @@ fn fs_rect(in: RectOut) -> @location(0) vec4f {
         let q = abs(in.p - center) - half_size + vec2f(in.params.x);
         d = length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - in.params.x;
         if (in.params.w > 0.0) {
-            let along = (in.p.x + in.p.y) / g.scale;
-            d += in.params.w * (sin(along * 0.023 + 1.3) * 0.6 + sin(along * 0.071) * 0.4);
+            // A scissor cut. Measured from the piece's own centre, so it keeps its shape as it
+            // moves, and finer on small pieces, where a slow wander would just look crooked.
+            let along = (in.p - center) / g.scale;
+            let phase = half_size.x * 0.37 / g.scale + half_size.y * 0.91 / g.scale;
+            let fine = clamp(130.0 * g.scale / max(half_size.x, half_size.y), 1.0, 2.6);
+            let t = (along.x + along.y * 1.37) * fine;
+            d += in.params.w * (sin(t * 0.023 + phase) * 0.6 + sin(t * 0.071 + phase * 2.3) * 0.4);
         }
     } else if (mode < 1.5) {
         let pa = in.p - in.a;
@@ -513,7 +718,17 @@ fn fs_rect(in: RectOut) -> @location(0) vec4f {
     } else {
         a = clamp(0.5 - d, 0.0, 1.0);
     }
-    return vec4f(in.color.rgb * in.color.a * a, in.color.a * a);
+    var col = in.color.rgb;
+    // Cut paper has tooth, and a little thickness that catches the light along its upper edge.
+    if (mode < 0.5 && in.params.w > 0.0 && blur == 0.0) {
+        col = paper(col, in.p);
+        let center = (in.a + in.b) * 0.5;
+        let half_size = (in.b - in.a) * 0.5;
+        let rim = smoothstep(-1.5 * g.scale, 0.0, d);
+        let to_edge = (in.p - center) / max(half_size, vec2f(1.0));
+        col *= 1.0 + rim * dot(to_edge, vec2f(-0.35, -0.75)) * 0.09;
+    }
+    return vec4f(col * in.color.a * a, in.color.a * a);
 }
 
 // ---------------------------------------------------------------- text

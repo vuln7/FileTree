@@ -5,6 +5,25 @@ use rodio::source::Source;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// What the player does during a capture, for the soundtrack. The capture stamps the times.
+#[cfg(feature = "capture")]
+pub enum Played {
+    Opened(PathBuf),
+    Toggled,
+    Sought(f32),
+    Closed,
+}
+
+#[cfg(feature = "capture")]
+pub static PLAYED: std::sync::Mutex<Vec<Played>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "capture")]
+impl Drop for AudioPlayer {
+    fn drop(&mut self) {
+        PLAYED.lock().unwrap().push(Played::Closed);
+    }
+}
+
 pub struct AudioPlayer {
     // Dropping the sink closes the device, so it has to live as long as the player.
     _sink: rodio::MixerDeviceSink,
@@ -22,10 +41,18 @@ impl AudioPlayer {
         sink.log_on_drop(false);
         let player = rodio::Player::connect_new(sink.mixer());
         player.append(source);
+        // A capture makes its soundtrack afterwards, and shouldn't make noise while it records.
+        #[cfg(feature = "capture")]
+        {
+            player.set_volume(0.0);
+            PLAYED.lock().unwrap().push(Played::Opened(path.to_path_buf()));
+        }
         Ok(AudioPlayer { _sink: sink, player, path: path.to_path_buf(), duration })
     }
 
     pub fn toggle(&self) {
+        #[cfg(feature = "capture")]
+        PLAYED.lock().unwrap().push(Played::Toggled);
         if self.player.is_paused() {
             self.player.play();
         } else {
@@ -46,6 +73,8 @@ impl AudioPlayer {
     }
 
     pub fn seek(&self, seconds: f32) {
+        #[cfg(feature = "capture")]
+        PLAYED.lock().unwrap().push(Played::Sought(seconds));
         let _ = self.player.try_seek(Duration::from_secs_f32(seconds.max(0.0)));
     }
 }

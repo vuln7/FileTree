@@ -85,7 +85,70 @@ fn zone_center(app: &App, wanted: &str) -> Option<(f32, f32)> {
     }
 }
 
+/// The soundtrack being gathered while a capture records.
+#[derive(Default)]
+struct Track {
+    path: String,
+    start: f32,
+    music: Vec<crate::sounds::Stretch>,
+    /// What's playing: its file, where in the file it started, and since when.
+    playing: Option<(PathBuf, f32, f32)>,
+    /// The file that's loaded, and where it's stopped when it isn't playing.
+    file: Option<PathBuf>,
+    paused_at: f32,
+}
+
+impl Track {
+    fn stop(&mut self, now: f32) {
+        if let Some((path, at, from)) = self.playing.take() {
+            self.paused_at = at + now - from;
+            self.music.push(crate::sounds::Stretch { from, to: now, path, at });
+        }
+    }
+
+    fn start(&mut self, now: f32) {
+        if let Some(path) = self.file.clone() {
+            self.playing = Some((path, self.paused_at, now));
+        }
+    }
+
+    fn heard(&mut self, event: crate::audio::Played, now: f32) {
+        use crate::audio::Played;
+        match event {
+            Played::Opened(path) => {
+                self.stop(now);
+                self.file = Some(path);
+                self.paused_at = 0.0;
+                self.start(now);
+            }
+            Played::Toggled => {
+                if self.playing.is_some() {
+                    self.stop(now);
+                } else {
+                    self.start(now);
+                }
+            }
+            Played::Sought(seconds) => {
+                let was_playing = self.playing.is_some();
+                self.stop(now);
+                self.paused_at = seconds;
+                if was_playing {
+                    self.start(now);
+                }
+            }
+            Played::Closed => {
+                self.stop(now);
+                self.file = None;
+            }
+        }
+    }
+}
+
+static TRACK: std::sync::Mutex<Option<Track>> = std::sync::Mutex::new(None);
+
 const STEP: f32 = 1.0 / 60.0;
+/// A day going by while the script runs: the hour now, hours per second, and where it ends.
+static LAPSE: std::sync::Mutex<Option<(f32, f32, f32)>> = std::sync::Mutex::new(None);
 static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn run(start: Option<PathBuf>, script: &str) {
@@ -133,6 +196,18 @@ pub fn run(start: Option<PathBuf>, script: &str) {
             "wheel" => {
                 app.on_pointer_move(num(1), num(2));
                 app.on_wheel(num(3));
+            }
+            // Opens something the way a person does: two clicks, close together.
+            "double-name" => {
+                let Some(to) = screen_of(&app, &command[1..].join(" ")) else { continue };
+                app.on_pointer_move(to.0, to.1);
+                frame(&mut app, &mut gpu, STEP);
+                for _ in 0..2 {
+                    app.on_pointer_down();
+                    frame(&mut app, &mut gpu, STEP);
+                    app.on_pointer_up();
+                    frame(&mut app, &mut gpu, STEP);
+                }
             }
             "click-name" | "hover-name" => {
                 let id = app.find_by_name(&command[1..].join(" "));
@@ -195,6 +270,7 @@ pub fn run(start: Option<PathBuf>, script: &str) {
                     "altleft" => Key::AltLeft,
                     "altright" => Key::AltRight,
                     "reset" => Key::Reset,
+                    "panel" => Key::TogglePanel,
                     "f2" => Key::Rename,
                     "del" => Key::Delete,
                     "end" => Key::End,
@@ -259,6 +335,7 @@ pub fn run(start: Option<PathBuf>, script: &str) {
                 app.on_pointer_move(ax, ay);
                 frame(&mut app, &mut gpu, STEP);
                 app.on_pointer_down();
+                advance(&mut app, &mut gpu, crate::app::HOLD_TO_CARRY + 0.05);
                 for i in 1..=12 {
                     let t = i as f32 / 12.0;
                     app.on_pointer_move(ax + (bx - ax) * t, ay + (by - ay) * t);
@@ -293,8 +370,20 @@ pub fn run(start: Option<PathBuf>, script: &str) {
             "record" => {
                 app.acts.film_cursor = true;
                 start_recording(width, height, arg(1));
+                app.sounds.log = Some(Vec::new());
+                *TRACK.lock().unwrap() = Some(Track { path: arg(1).to_string(), start: app.wall, ..Default::default() });
             }
-            "stop-record" => stop_recording(),
+            // Ends the video and writes what the app played beside it, as <video>.wav.
+            "stop-record" => {
+                stop_recording();
+                if let Some(mut track) = TRACK.lock().unwrap().take() {
+                    track.stop(app.wall);
+                    let log = app.sounds.log.take().unwrap_or_default();
+                    println!("soundtrack: {} sounds, {} stretches of music", log.len(), track.music.len());
+                    let wav = crate::sounds::soundtrack(&log, &track.music, track.start, app.wall - track.start + 1.5);
+                    crate::sounds::write_wav(&format!("{}.wav", track.path), &wav);
+                }
+            }
             "mark" => println!("mark {} at frame {} ({:.3} s)", arg(1), FRAMES.load(std::sync::atomic::Ordering::Relaxed), FRAMES.load(std::sync::atomic::Ordering::Relaxed) as f32 / 60.0),
             // glide-name 0.6 Photos   /   glide-zone 0.5 ToastUndo(0)   /   glide-menu 0.4 Rename   /   glide 0.5 300 400
             "glide" => glide(&mut app, &mut gpu, (num(2), num(3)), num(1)),
@@ -435,14 +524,56 @@ pub fn run(start: Option<PathBuf>, script: &str) {
             }
             "settle" => {
                 // Runs until nothing at all is moving, so a capture shows the true resting state.
-                app.idle_for = 100.0;
+                app.idle_for = 100_000.0;
                 let mut seconds = 0.0;
                 while frame(&mut app, &mut gpu, STEP) && seconds < 30.0 {
                     seconds += STEP;
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
+            // Writes every interaction sound to a folder, to listen to and measure.
+            "sound-bank" => {
+                for (name, cue) in crate::sounds::bank() {
+                    for take in 1..=3u32 {
+                        let path = format!("{}/{name}-{take}.wav", arg(1));
+                        crate::sounds::write_wav(&path, &crate::sounds::render(cue, take * 131, 0.0));
+                    }
+                }
+                use crate::sounds::Cue::*;
+                let tour = crate::sounds::tour(&[
+                    (0.3, Pick, -0.2),
+                    (1.0, Pick, 0.2),
+                    (1.25, Grow, 0.1),
+                    (1.45, Bloom(0), 0.3),
+                    (1.5, Bloom(1), 0.35),
+                    (1.56, Bloom(2), 0.4),
+                    (1.61, Bloom(3), 0.45),
+                    (1.66, Bloom(4), 0.5),
+                    (2.6, Pick, 0.4),
+                    (3.2, Slide, 0.6),
+                    (4.0, Tick, 0.5),
+                    (4.5, Close, 0.1),
+                    (5.3, Rustle(0.15), 0.0),
+                    (6.3, Lift, -0.3),
+                    (7.0, Land, 0.3),
+                    (8.2, Shed, 0.2),
+                    (9.6, Regrow, 0.2),
+                    (10.5, Knock, 0.0),
+                    (11.2, Rustle(1.0), 0.0),
+                ]);
+                crate::sounds::write_wav(&format!("{}/tour.wav", arg(1)), &tour);
+            }
+            // Sets the time of day, to see the world at any hour.
+            "hour" => app.garden.hour_override = Some(num(1)),
+            // lapse 6.5 22 118: the day passes from one hour to another over that many seconds.
+            "lapse" => *LAPSE.lock().unwrap() = Some((num(1), (num(2) - num(1)) / num(3).max(0.01), num(2))),
+            // Wakes the world up after a settle, and lets it run.
+            "wake" => {
+                app.wake_wind();
+                advance(&mut app, &mut gpu, num(1));
+            }
             "idle-check" => {
+                app.idle_for = 100_000.0;
                 // Runs until nothing is animating and reports how long that took.
                 let mut seconds = 0.0;
                 app.focused = true;
@@ -481,7 +612,20 @@ fn advance(app: &mut App, gpu: &mut Gpu, seconds: f32) {
 }
 
 fn frame(app: &mut App, gpu: &mut Gpu, dt: f32) -> bool {
+    {
+        // Whatever the last command did happens on the frame about to be drawn.
+        let events: Vec<_> = crate::audio::PLAYED.lock().unwrap().drain(..).collect();
+        if let Some(track) = TRACK.lock().unwrap().as_mut() {
+            for event in events {
+                track.heard(event, app.wall);
+            }
+        }
+    }
     app.wall += dt;
+    if let Some(lapse) = LAPSE.lock().unwrap().as_mut() {
+        lapse.0 = (lapse.0 + lapse.1 * dt).min(lapse.2);
+        app.garden.hour_override = Some(lapse.0);
+    }
     app.pump_events();
     app.redraw = false;
     let mut more = app.tick(dt);

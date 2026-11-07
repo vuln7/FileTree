@@ -238,3 +238,39 @@ pub fn tell_user(message: &str) {
 pub fn tell_user(message: &str) {
     eprintln!("{message}");
 }
+
+/// How close together two clicks must be to count as a double-click, as this person has it set.
+#[cfg(windows)]
+pub fn double_click_seconds() -> f32 {
+    // SAFETY: takes no arguments and only reads a system setting.
+    let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+    if ms == 0 { 0.5 } else { ms as f32 / 1000.0 }
+}
+
+#[cfg(not(windows))]
+pub fn double_click_seconds() -> f32 {
+    0.5
+}
+
+/// The hour of the day where this computer is, from 0 up to 24.
+/// A file whose being there means sounds are off, so the choice lasts between runs.
+pub fn sound_off_marker() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("XDG_CONFIG_HOME")).or_else(|| std::env::var_os("HOME"))?;
+    Some(std::path::PathBuf::from(base).join("FileTree").join("sound-off"))
+}
+
+#[cfg(windows)]
+pub fn local_hour() -> f32 {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    let mut now: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: fills in the structure it's given, and nothing else.
+    unsafe { GetLocalTime(&mut now) };
+    now.wHour as f32 + now.wMinute as f32 / 60.0
+}
+
+#[cfg(not(windows))]
+pub fn local_hour() -> f32 {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    (secs % 86_400) as f32 / 3600.0
+}

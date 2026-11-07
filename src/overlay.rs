@@ -9,7 +9,7 @@ use crate::palette as p;
 use crate::scene::{draw_text, fit_label};
 use crate::text::{Face, Text};
 use crate::tree::NONE;
-use crate::ui::{Icon, draw_icon, format_size, line, rect, soft_rect, with_alpha, wrap};
+use crate::ui::{CUT, Icon, cut_rect, draw_icon, format_size, line, paper, rect, soft_rect, with_alpha, wrap};
 
 const NO_HALO: [f32; 4] = [0.0; 4];
 const QUICK: usize = 6;
@@ -47,6 +47,9 @@ impl App {
         if let Some((r, _)) = &mut l.image_rect {
             *r = [r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy];
         }
+        // A layer can hold less than the mark: with the panel away, it has nothing in it at all.
+        let rects = rects.min(l.rects.len());
+        let glyphs = glyphs.min(l.glyphs.len());
         for r in &mut l.rects[rects..] {
             let ring_or_box = r.params[2] > 1.5;
             r.a = [r.a[0] + dx, r.a[1] + dy];
@@ -70,7 +73,7 @@ impl App {
         }
         let e = 1.0 - (1.0 - t).powi(3);
         let dy = (1.0 - e) * 10.0 * self.scale;
-        self.settle_layer(1, 2, 0, e, 0.0, dy);
+        self.settle_layer(1, 4, 0, e, 0.0, dy);
         self.settle_layer(2, 0, 0, e, 0.0, dy);
         self.settle_layer(3, 0, 0, e, 0.0, dy);
     }
@@ -124,8 +127,7 @@ impl App {
         let from_glyphs = self.draw.ui[TOP].glyphs.len();
         {
             let l = &mut self.draw.ui[TOP];
-            l.rects.push(soft_rect([x + 2.0 * s, y + 6.0 * s], [x + width + 2.0 * s, y + height + 6.0 * s], 4.0 * s, 7.0 * s, with_alpha(rgb(p::SHADOW), 0.5)));
-            l.rects.push(rect([x, y], [x + width, y + height], 4.0 * s, rgb(p::CREAM)));
+            paper(l, [x, y], [x + width, y + height], rgb(p::CREAM), 1.0, s);
         }
         let mut ry = y + 6.0 * s;
         for (i, (cmd, label, enabled, danger)) in rows.iter().enumerate() {
@@ -142,7 +144,7 @@ impl App {
             let ink = rgb(p::INK);
             if lit > 0.0 {
                 let fill = if *danger { rgb(p::DANGER) } else { ink };
-                self.draw.ui[TOP].rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, with_alpha(fill, lit)));
+                self.draw.ui[TOP].rects.push(cut_rect([r[0], r[1]], [r[2], r[3]], CUT * s, with_alpha(fill, lit)));
             }
             let idle = if !enabled {
                 with_alpha(ink, 0.35)
@@ -203,8 +205,7 @@ impl App {
         {
             let l = &mut self.draw.ui[OVER];
             l.rects.push(rect([0.0, 0.0], [self.width, self.height], 0.0, with_alpha(rgb(p::SHADOW), 0.42)));
-            l.rects.push(soft_rect([x + 3.0 * s, y + 8.0 * s], [x + width + 3.0 * s, y + height + 8.0 * s], 5.0 * s, 10.0 * s, with_alpha(rgb(p::SHADOW), 0.5)));
-            l.rects.push(rect([x, y], [x + width, y + height], 5.0 * s, rgb(p::CREAM)));
+            paper(l, [x, y], [x + width, y + height], rgb(p::CREAM), 1.0, s);
         }
         let mut cy = y + 24.0 * s;
         let out = &mut self.draw.ui[OVER].glyphs;
@@ -225,8 +226,8 @@ impl App {
             let ring = if problem.is_some() { rgb(p::DANGER) } else { rgb(p::GROUND) };
             {
                 let l = &mut self.draw.ui[OVER];
-                l.rects.push(rect([bx0 - 2.0 * s, cy - 2.0 * s], [bx1 + 2.0 * s, cy + h + 2.0 * s], 4.0 * s, ring));
-                l.rects.push(rect([bx0, cy], [bx1, cy + h], 3.0 * s, rgb(0xffffff)));
+                l.rects.push(cut_rect([bx0 - 2.0 * s, cy - 2.0 * s], [bx1 + 2.0 * s, cy + h + 2.0 * s], CUT * s, ring));
+                l.rects.push(cut_rect([bx0, cy], [bx1, cy + h], CUT * s, rgb(p::PRINT)));
             }
             // The text is drawn in pieces so the selection can have its own colour behind it.
             let text_x = bx0 + 10.0 * s;
@@ -269,10 +270,8 @@ impl App {
         let blocked = problem.is_some();
         {
             let l = &mut self.draw.ui[OVER];
-            l.rects.push(rect([ok[0], ok[1]], [ok[2], ok[3]], 3.0 * s, with_alpha(fill, if blocked { 0.4 } else { 1.0 })));
-            l.rects.push(rect([no[0], no[1]], [no[2], no[3]], 3.0 * s, rgb(p::INK)));
-            let t = 1.4 * s;
-            l.rects.push(rect([no[0] + t, no[1] + t], [no[2] - t, no[3] - t], 2.0 * s, crate::scene::mix_rgb(rgb(p::CREAM), rgb(p::PANEL_HOVER), no_hover)));
+            paper(l, [ok[0], ok[1]], [ok[2], ok[3]], with_alpha(fill, if blocked { 0.4 } else { 1.0 }), 0.2 + ok_hover * 0.8, s);
+            paper(l, [no[0], no[1]], [no[2], no[3]], crate::scene::mix_rgb(rgb(p::PREVIEW_BG), rgb(p::PANEL_HOVER), no_hover), 0.2 + no_hover * 0.8, s);
         }
         let base = by + 18.0 * s + 13.5 * s * 0.36;
         let out = &mut self.draw.ui[OVER].glyphs;
@@ -301,8 +300,7 @@ impl App {
             let top = y - h;
             let label = if progress > 0.0 { format!("Working… {:.0}%", progress * 100.0) } else { "Working…".to_string() };
             let l = &mut self.draw.ui[TOP];
-            l.rects.push(soft_rect([x + 1.0 * s, top + 4.0 * s], [x + width + 1.0 * s, y + 4.0 * s], 4.0 * s, 5.0 * s, with_alpha(rgb(p::SHADOW), 0.45)));
-            l.rects.push(rect([x, top], [x + width, y], 4.0 * s, rgb(p::INK)));
+            paper(l, [x, top], [x + width, y], rgb(p::INK), 0.7, s);
             l.rects.push(rect([x, y - 3.0 * s], [x + width * progress.clamp(0.0, 1.0), y], 1.5 * s, rgb(p::SPECIES[5][0])));
             let out = &mut self.draw.ui[TOP].glyphs;
             draw_text(&mut self.text, out, &label, Face::Ui, 13.5 * s, x + 14.0 * s, top + h * 0.5 + 4.8 * s, rgb(p::CREAM), NO_HALO);
@@ -326,8 +324,7 @@ impl App {
             {
                 let fill = if error { rgb(p::DANGER_INK) } else { rgb(p::INK) };
                 let l = &mut self.draw.ui[TOP];
-                l.rects.push(soft_rect([x + 1.0 * s, top + 4.0 * s], [x + width + 1.0 * s, y + 4.0 * s], 4.0 * s, 5.0 * s, with_alpha(rgb(p::SHADOW), 0.45)));
-                l.rects.push(rect([x, top], [x + width, y], 4.0 * s, fill));
+                paper(l, [x, top], [x + width, y], fill, 0.7, s);
             }
             let out = &mut self.draw.ui[TOP].glyphs;
             draw_text(&mut self.text, out, &label, Face::Ui, size, x + 16.0 * s, top + h * 0.5 + size * 0.36, rgb(p::CREAM), NO_HALO);
@@ -335,7 +332,7 @@ impl App {
                 let r = [x + width - undo_w, top, x + width, y];
                 let action = Action::ToastUndo(i);
                 let lit = self.hov(action);
-                self.draw.ui[TOP].rects.push(rect([r[0] + 4.0 * s, r[1] + 5.0 * s], [r[2] - 5.0 * s, r[3] - 5.0 * s], 3.0 * s, with_alpha(rgb(p::CREAM), 0.12 + lit * 0.18)));
+                self.draw.ui[TOP].rects.push(cut_rect([r[0] + 4.0 * s, r[1] + 5.0 * s], [r[2] - 5.0 * s, r[3] - 5.0 * s], CUT * s, with_alpha(rgb(p::CREAM), 0.12 + lit * 0.18)));
                 let out = &mut self.draw.ui[TOP].glyphs;
                 draw_text(&mut self.text, out, "Undo", Face::UiBold, size, r[0] + 15.0 * s, top + h * 0.5 + size * 0.36, rgb(p::CREAM), NO_HALO);
                 self.zones.push(crate::app::Zone { rect: r, action });
@@ -381,7 +378,7 @@ impl App {
         let x = px + 14.0 * s;
         let y = py + 38.0 * s;
         let fill = if target != NONE { rgb(p::INK) } else { with_alpha(rgb(p::INK), 0.72) };
-        self.draw.ui[TOP].rects.push(rect([x, y], [x + width, y + 26.0 * s], 3.0 * s, fill));
+        paper(&mut self.draw.ui[TOP], [x, y], [x + width, y + 26.0 * s], fill, 0.7, s);
         let out = &mut self.draw.ui[TOP].glyphs;
         draw_text(&mut self.text, out, &label, Face::Ui, size, x + 10.0 * s, y + 13.0 * s + size * 0.36, rgb(p::CREAM), NO_HALO);
         // The folder being aimed at gets a paper ring, so it's clear what the drop will hit.
@@ -425,8 +422,7 @@ impl App {
         {
             let l = &mut self.draw.ui[QUICK];
             l.rects.push(rect([0.0, 0.0], [w, h], 0.0, with_alpha(rgb(p::SHADOW), 0.72 * open)));
-            l.rects.push(soft_rect([x0 + 4.0 * s, y0 + 10.0 * s], [x1 + 4.0 * s, y1 + 10.0 * s], 6.0 * s, 14.0 * s, with_alpha(rgb(p::SHADOW), 0.55 * open)));
-            l.rects.push(rect([x0, y0], [x1, y1], 6.0 * s, rgb(p::CREAM)));
+            paper(l, [x0, y0], [x1, y1], with_alpha(rgb(p::CREAM), open), 1.0, s);
         }
         let room = x1 - x0 - 400.0 * s;
         let title = fit_label(&mut self.text, &name, Face::Display, 26.0 * s, room);
@@ -444,7 +440,7 @@ impl App {
             let lit = self.hov(action);
             let l = &mut self.draw.ui[QUICK];
             if lit > 0.0 {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, with_alpha(rgb(p::PANEL_HOVER), lit)));
+                paper(l, [r[0], r[1]], [r[2], r[3]], with_alpha(rgb(p::PREVIEW_BG), lit), lit * 0.7, s);
             }
             draw_icon(l, icon, [(r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5], s, rgb(p::INK));
             self.zones.push(crate::app::Zone { rect: r, action });
@@ -454,14 +450,14 @@ impl App {
         let r = [cx - open_w - 8.0 * s, y0 + 13.0 * s, cx - 8.0 * s, y0 + 49.0 * s];
         let action = Action::Cmd(Cmd::Open);
         let lit = self.hov(action);
-        self.draw.ui[QUICK].rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, crate::scene::mix_rgb(rgb(p::INK), rgb(p::BAR_HOVER), lit)));
+        paper(&mut self.draw.ui[QUICK], [r[0], r[1]], [r[2], r[3]], crate::scene::mix_rgb(rgb(p::INK), rgb(p::BAR_HOVER), lit), 0.2 + lit * 0.8, s);
         let out = &mut self.draw.ui[QUICK].glyphs;
         draw_text(&mut self.text, out, "Open", Face::UiBold, 13.5 * s, r[0] + 15.0 * s, y0 + 31.0 * s + 13.5 * s * 0.36, rgb(p::CREAM), NO_HALO);
         self.zones.push(crate::app::Zone { rect: r, action });
 
         // The contents.
         let (cx0, cy0, cx1, cy1) = (x0 + 14.0 * s, y0 + header, x1 - 14.0 * s, y1 - 14.0 * s);
-        self.draw.ui[QUICK].rects.push(rect([cx0, cy0], [cx1, cy1], 4.0 * s, rgb(p::PREVIEW_BG)));
+        self.draw.ui[QUICK].rects.push(cut_rect([cx0, cy0], [cx1, cy1], CUT * s, rgb(p::PREVIEW_BG)));
         self.draw.ui[QUICK_CLIP].clip = Some([cx0, cy0, cx1, cy1]);
         let (cw, ch) = (cx1 - cx0, cy1 - cy0);
         let center = [(cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5];

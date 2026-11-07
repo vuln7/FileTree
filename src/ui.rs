@@ -20,8 +20,20 @@ pub fn soft_rect(a: [f32; 2], b: [f32; 2], radius: f32, blur: f32, color: [f32; 
 }
 
 /// A big sheet of paper, with the slightly uneven edge of a scissor cut.
-fn cut_rect(a: [f32; 2], b: [f32; 2], wander: f32, color: [f32; 4]) -> RectInst {
+pub fn cut_rect(a: [f32; 2], b: [f32; 2], wander: f32, color: [f32; 4]) -> RectInst {
     RectInst { a, b, params: [0.0, 0.0, 0.0, wander], color }
+}
+
+/// How far a small piece's scissor cut wanders, at scale 1.
+pub const CUT: f32 = 0.8;
+
+/// A piece of paper lying on whatever is under it: cut by hand, casting the one light's shadow.
+/// `lift` raises it off the page, from 0 at rest to 1 when it's being reached for.
+pub fn paper(layer: &mut UiLayer, a: [f32; 2], b: [f32; 2], color: [f32; 4], lift: f32, s: f32) {
+    let (ox, oy) = ((0.8 + 1.0 * lift) * s, (1.6 + 2.4 * lift) * s);
+    let shadow = with_alpha(rgb(p::SHADOW), (0.30 + 0.14 * lift) * color[3]);
+    layer.rects.push(soft_rect([a[0] + ox, a[1] + oy], [b[0] + ox, b[1] + oy], 2.0 * s, (2.2 + 2.6 * lift) * s, shadow));
+    layer.rects.push(cut_rect(a, b, CUT * s, color));
 }
 
 pub fn line(a: [f32; 2], b: [f32; 2], radius: f32, color: [f32; 4]) -> RectInst {
@@ -57,6 +69,8 @@ pub enum Icon {
     More,
     NewFolder,
     Paste,
+    SoundOn,
+    SoundOff,
 }
 
 /// Icons are drawn as line work, all on one 20-unit grid with one stroke weight.
@@ -167,6 +181,27 @@ pub fn draw_icon(layer: &mut UiLayer, icon: Icon, c: [f32; 2], s: f32, color: [f
                 seg(pt(pair[0].0, pair[0].1), pt(pair[1].0, pair[1].1));
             }
         }
+        Icon::SoundOn | Icon::SoundOff => {
+            // A speaker, the same in both.
+            seg(pt(-8.0, -2.4), pt(-8.0, 2.4));
+            seg(pt(-8.0, -2.4), pt(-5.2, -2.4));
+            seg(pt(-8.0, 2.4), pt(-5.2, 2.4));
+            seg(pt(-5.2, -2.4), pt(-1.0, -6.0));
+            seg(pt(-5.2, 2.4), pt(-1.0, 6.0));
+            seg(pt(-1.0, -6.0), pt(-1.0, 6.0));
+            if matches!(icon, Icon::SoundOn) {
+                // Sound coming off it.
+                seg(pt(2.0, -3.4), pt(3.8, -1.4));
+                seg(pt(3.8, -1.4), pt(3.8, 1.4));
+                seg(pt(3.8, 1.4), pt(2.0, 3.4));
+                seg(pt(5.0, -6.0), pt(7.6, -2.6));
+                seg(pt(7.6, -2.6), pt(7.6, 2.6));
+                seg(pt(7.6, 2.6), pt(5.0, 6.0));
+            } else {
+                seg(pt(3.0, -3.0), pt(8.0, 3.0));
+                seg(pt(3.0, 3.0), pt(8.0, -3.0));
+            }
+        }
         Icon::Calm => {
             // A straight stem: reduced motion.
             seg(pt(-7.0, 0.0), pt(7.0, 0.0));
@@ -234,6 +269,13 @@ pub fn now_secs() -> i64 {
 }
 
 const ROW_H: f32 = 32.0;
+/// How tall the strip of soil at the foot of the panel is.
+const PANEL_SOIL: f32 = 26.0;
+
+/// One step of the breadcrumb: a small leaf, turned up and out along the path.
+fn crumb_leaf(layer: &mut UiLayer, x: f32, y: f32, s: f32) {
+    layer.flowers.push(FlowerInst { pos: [x, y], radius: 5.5 * s, rotation: -0.55, bloom: 1.0, species: p::LEAF, seed: 2.0, lift: 0.0, dim: 0.0 });
+}
 
 impl App {
     pub fn layer(&mut self, index: usize) -> &mut UiLayer {
@@ -254,11 +296,14 @@ impl App {
         for i in 0..10 {
             self.layer(i);
         }
+        self.draw_fireflies();
         self.build_status();
         self.build_marks();
         self.build_branch_handle();
         self.build_panel();
         self.settle_panel();
+        self.build_panel_ground();
+        self.build_panel_tab();
         self.build_toolbar();
         self.build_tooltip();
         self.build_overlays();
@@ -372,9 +417,11 @@ impl App {
             let r = [x, y, x + size, y + size];
             let lit = if enabled { self.hov(action) } else { 0.0 };
             let color = with_alpha(cream, if enabled { 1.0 } else { 0.4 });
+            let down = self.is_pressing(action);
             let l = self.layer(layer);
             if lit > 0.0 {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, with_alpha(rgb(p::BAR_HOVER), lit)));
+                let fill = with_alpha(rgb(p::BAR_HOVER), lit);
+                paper(l, [r[0], r[1]], [r[2], r[3]], fill, if down { 0.0 } else { lit * 0.6 }, s);
             }
             draw_icon(l, icon, [x + size * 0.5, y + size * 0.5], s, color);
             if enabled {
@@ -393,17 +440,11 @@ impl App {
         let ink = rgb(p::INK);
         {
             let l = self.layer(layer);
-            l.rects.push(rect([search_x0, search_y], [search_x1, search_y + search_h], 3.0 * s, cream));
             if active {
                 let focus = rgb(p::FOCUS_RING);
-                l.rects.push(RectInst {
-                    a: [search_x0 - 2.0 * s, search_y - 2.0 * s],
-                    b: [search_x1 + 2.0 * s, search_y + search_h + 2.0 * s],
-                    params: [4.0 * s, 0.0, 0.0, 0.0],
-                    color: focus,
-                });
-                l.rects.push(rect([search_x0, search_y], [search_x1, search_y + search_h], 3.0 * s, cream));
+                l.rects.push(cut_rect([search_x0 - 2.0 * s, search_y - 2.0 * s], [search_x1 + 2.0 * s, search_y + search_h + 2.0 * s], CUT * s, focus));
             }
+            paper(l, [search_x0, search_y], [search_x1, search_y + search_h], cream, if active { 0.6 } else { 0.0 }, s);
             draw_icon(l, Icon::Search, [search_x0 + 18.0 * s, search_y + search_h * 0.5], s * 0.86, ink);
         }
         self.zone([search_x0, search_y, search_x1, search_y + search_h], Action::SearchField);
@@ -459,7 +500,8 @@ impl App {
         let crumbs = self.crumbs();
         let size_text = 14.0 * s;
         let gap = 6.0 * s;
-        let sep_w = self.text.width("/", Face::Ui, size_text);
+        // Each step of the path is marked by a small leaf, as if the path were a stem.
+        let sep_w = 9.0 * s;
         let widths: Vec<f32> = crumbs
             .iter()
             .enumerate()
@@ -484,9 +526,7 @@ impl App {
             let mut adv = draw_text(text, out, "…", Face::Ui, size_text, cx, baseline, muted, NO_HALO);
             adv += gap;
             cx += adv;
-            let text = &mut self.text;
-            let out = &mut self.draw.ui[layer].glyphs;
-            draw_text(text, out, "/", Face::Ui, size_text, cx, baseline, muted, NO_HALO);
+            crumb_leaf(self.layer(layer), cx + sep_w * 0.5, h * 0.5, s);
             cx += sep_w + gap;
         }
         for (i, crumb) in crumbs.iter().enumerate().skip(start) {
@@ -499,7 +539,7 @@ impl App {
             let lit = self.hov(action);
             let l = self.layer(layer);
             if lit > 0.0 {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, with_alpha(rgb(p::BAR_HOVER), lit)));
+                paper(l, [r[0], r[1]], [r[2], r[3]], with_alpha(rgb(p::BAR_HOVER), lit), lit * 0.5, s);
             }
             let color = if last { cream } else { mix_rgb(cream, bar, 0.14) };
             let text = &mut self.text;
@@ -508,9 +548,7 @@ impl App {
             self.zone(r, action);
             cx += width + gap;
             if !last {
-                let text = &mut self.text;
-                let out = &mut self.draw.ui[layer].glyphs;
-                draw_text(text, out, "/", Face::Ui, size_text, cx, baseline, muted, NO_HALO);
+                crumb_leaf(self.layer(layer), cx + sep_w * 0.5, h * 0.5, s);
                 cx += sep_w + gap;
             }
         }
@@ -540,8 +578,7 @@ impl App {
         let tab = [8.0 * s, self.height - 36.0 * s, 8.0 * s + width + 20.0 * s, self.height - 6.0 * s];
         {
             let l = self.layer(layer);
-            l.rects.push(soft_rect([tab[0] + 1.0 * s, tab[1] + 3.0 * s], [tab[2] + 1.0 * s, tab[3] + 3.0 * s], 3.0 * s, 3.0 * s, with_alpha(rgb(p::SHADOW), 0.35)));
-            l.rects.push(rect([tab[0], tab[1]], [tab[2], tab[3]], 3.0 * s, with_alpha(rgb(p::BAR), 1.0)));
+            paper(l, [tab[0], tab[1]], [tab[2], tab[3]], rgb(p::BAR), 0.2, s);
         }
         self.zone(tab, Action::Nothing);
         let text = &mut self.text;
@@ -555,21 +592,20 @@ impl App {
         let mut x = stage[2] - size - 10.0 * s;
         let show_hidden = self.tree.show_hidden;
         let calm = self.reduced_motion;
+        let sound = self.sounds.on;
         for (icon, action) in [
             (Icon::Fit, Action::Fit),
             (Icon::Reset, Action::Reset),
             (if show_hidden { Icon::Eye } else { Icon::EyeOff }, Action::ToggleHidden),
             (if calm { Icon::Calm } else { Icon::Lively }, Action::ToggleMotion),
+            (if sound { Icon::SoundOn } else { Icon::SoundOff }, Action::ToggleSound),
         ] {
             let r = [x, y, x + size, y + size];
             let lit = self.hov(action);
+            let down = self.is_pressing(action);
+            let at = if down { 1.0 * s } else { 0.0 };
             let l = self.layer(layer);
-            l.rects.push(rect(
-                [r[0], r[1]],
-                [r[2], r[3]],
-                3.0 * s,
-                with_alpha(mix_rgb(rgb(p::BAR), rgb(p::BAR_HOVER), lit), 0.85 + lit * 0.15),
-            ));
+            paper(l, [r[0], r[1] + at], [r[2], r[3] + at], mix_rgb(rgb(p::BAR), rgb(p::BAR_HOVER), lit), if down { 0.0 } else { 0.2 + lit * 0.6 }, s);
             draw_icon(l, icon, [x + size * 0.5, y + size * 0.5], s * 0.82, cream);
             self.zone(r, action);
             x -= size + 4.0 * s;
@@ -637,6 +673,7 @@ impl App {
         match n.load {
             Load::Loading => format!("Reading {}…", n.name),
             Load::Failed => "This branch couldn't be read".to_string(),
+            Load::Unloaded if n.kind == Kind::Dir => format!("{}: closed", n.name),
             _ => {
                 let (folders, files) = (n.dir_count, n.file_count);
                 if n.kind == Kind::Places {
@@ -657,16 +694,26 @@ impl App {
     fn build_panel(&mut self) {
         let s = self.scale;
         let layer = 1;
-        let x1 = self.width;
-        let x0 = x1 - self.panel_width();
+        // Tucked away, it slides off the right edge at its full width, so nothing reflows.
+        let x0 = self.stage()[2];
+        let x1 = x0 + self.panel_width();
         let y0 = self.toolbar_height();
         let y1 = self.height;
+        if x0 >= self.width - 0.5 {
+            return;
+        }
         {
+            // Two sheets, the lower one just showing past the edge of the one on top.
             let l = self.layer(layer);
-            l.rects.push(soft_rect([x0 - 1.0 * s, y0 - 20.0], [x1 + 20.0, y1 + 20.0], 0.0, 7.0 * s, with_alpha(rgb(p::SHADOW), 0.5)));
+            l.rects.push(soft_rect([x0 - 6.0 * s, y0 - 20.0], [x1 + 20.0, y1 + 20.0], 0.0, 7.0 * s, with_alpha(rgb(p::SHADOW), 0.5)));
+            l.rects.push(cut_rect([x0 - 5.0 * s, y0 - 12.0], [x1 + 12.0, y1 + 12.0], 2.2 * s, rgb(p::PREVIEW_BG)));
+            l.rects.push(soft_rect([x0 - 1.0 * s, y0 - 20.0], [x1 + 20.0, y1 + 20.0], 0.0, 3.0 * s, with_alpha(rgb(p::SHADOW), 0.28)));
             l.rects.push(cut_rect([x0, y0 - 12.0], [x1 + 12.0, y1 + 12.0], 1.5 * s, rgb(p::CREAM)));
         }
         self.zone([x0, y0, x1, y1], Action::PanelScroll);
+        // Everything in the panel stands above the strip of soil at its foot.
+        let y1 = y1 - PANEL_SOIL * s;
+        self.acts.panel_used = y0 + 320.0 * s;
 
         if self.search_active && !self.search_text.is_empty() && !self.looks_like_path() {
             self.panel_search(x0, y0, x1, y1);
@@ -692,6 +739,81 @@ impl App {
         } else {
             self.panel_folder(x0, y0, x1, y1);
         }
+    }
+
+    /// The panel stands on the same ground as the tree: a strip of soil at its foot, and a small
+    /// sprout where there's room for one.
+    fn build_panel_ground(&mut self) {
+        let s = self.scale;
+        let x0 = self.stage()[2];
+        if x0 >= self.width - 0.5 {
+            return;
+        }
+        let x1 = x0 + self.panel_width();
+        let top = self.height - PANEL_SOIL * s;
+        // In the same light as the soil across the rest of the window.
+        let night = self.sky()[2];
+        let lit = |c: [f32; 4]| [c[0] * (1.0 - night * 0.48), c[1] * (1.0 - night * 0.42), c[2] * (1.0 - night * 0.22), c[3]];
+        let (back, front) = (lit(mix_rgb(rgb(p::SOIL), rgb(p::SHADOW), 0.22)), lit(rgb(p::SOIL)));
+        let room = top - self.acts.panel_used;
+        let sprout = room > 84.0 * s;
+        let cx = x1 - 44.0 * s;
+        let l = &mut self.draw.ui[1];
+        if sprout {
+            l.rects.push(line([cx, top + 6.0 * s], [cx + 2.0 * s, top - 40.0 * s], 1.5 * s, rgb(p::SPECIES[9][0])));
+        }
+        l.rects.push(cut_rect([x0 - 8.0 * s, top], [x1 + 12.0, self.height + 12.0], 1.8 * s, back));
+        l.rects.push(soft_rect([x0 - 8.0 * s, top + 5.0 * s], [x1 + 12.0, self.height + 12.0], 0.0, 3.0 * s, with_alpha(rgb(p::SHADOW), 0.3)));
+        l.rects.push(cut_rect([x0 - 8.0 * s, top + 8.0 * s], [x1 + 12.0, self.height + 12.0], 1.5 * s, front));
+        if sprout {
+            let f = &mut self.draw.ui[2].flowers;
+            let leaf = |pos: [f32; 2], radius: f32, rotation: f32, seed: f32| FlowerInst { pos, radius, rotation, bloom: 1.0, species: p::LEAF, seed, lift: 0.3, dim: 0.0 };
+            f.push(leaf([cx + 11.0 * s, top - 15.0 * s], 12.0 * s, -0.35, 3.0));
+            f.push(leaf([cx - 10.0 * s, top - 24.0 * s], 10.0 * s, -2.75, 8.0));
+            f.push(FlowerInst {
+                pos: [cx + 2.0 * s, top - 47.0 * s],
+                radius: 13.0 * s,
+                rotation: std::f32::consts::FRAC_PI_2,
+                bloom: 1.0,
+                species: p::BUD,
+                seed: 5.0,
+                lift: 0.5,
+                dim: 0.0,
+            });
+        }
+    }
+
+    /// A paper leaf growing from behind the panel's edge, which tucks it away and brings it back.
+    fn build_panel_tab(&mut self) {
+        let s = self.scale;
+        let edge = self.stage()[2];
+        let y = (self.toolbar_height() + self.height) * 0.5;
+        let action = Action::TogglePanel;
+        let lit = self.hov(action);
+        let hidden = self.panel_hidden();
+        let open = self.panel_open.value.clamp(0.0, 1.0);
+        // It swings as the panel moves, reaches out when pointed at, and stirs in the breeze.
+        let breeze = (self.time * 1.3).sin() * 0.035 * self.wind.value;
+        let rotation = -std::f32::consts::PI + (open - 0.5) * 0.3 + lit * 0.1 + breeze;
+        let radius = (31.0 + lit * 3.0) * s;
+        let center = [edge - radius * 0.72, y];
+        // Below the panel in the stack, so its base disappears behind the paper.
+        let l = self.layer(0);
+        l.flowers.push(FlowerInst {
+            pos: center,
+            radius,
+            rotation,
+            bloom: 1.0,
+            species: p::LEAF,
+            seed: 12.0,
+            lift: 0.35 + lit * 0.45,
+            dim: 0.0,
+        });
+        // A small mark on the leaf, pointing the way the panel will go.
+        let icon = if hidden { Icon::Back } else { Icon::Forward };
+        draw_icon(self.layer(4), icon, [center[0] - 2.0 * s, y], s * 0.62, rgb(p::CREAM));
+        let reach = 20.0 * s;
+        self.zone([edge - radius * 1.7, y - reach, edge + 3.0 * s, y + reach], action);
     }
 
     fn panel_message(&mut self, x0: f32, y0: f32, x1: f32, title: &str, body: &str) {
@@ -737,27 +859,31 @@ impl App {
         y + 2.0 * s
     }
 
+    /// Whether this control is being held down right now.
+    fn is_pressing(&self, action: Action) -> bool {
+        self.pressed_at.is_some() && self.press_zone == Some(action) && self.hover_action == action
+    }
+
     fn panel_button(&mut self, x: f32, y: f32, label: &str, action: Action, primary: bool) -> f32 {
         let s = self.scale;
         let h = 36.0 * s;
         let size = 13.5 * s;
         let width = self.text.width(label, Face::UiBold, size) + 28.0 * s;
-        let r = [x, y, x + width, y + h];
         let lit = self.hov(action);
-        let ink = rgb(p::INK);
-        let l = &mut self.draw.ui[1];
-        if primary {
-            l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, mix_rgb(ink, rgb(p::BAR_HOVER), lit)));
+        let down = self.is_pressing(action);
+        // Reaching for it lifts it off the page; pressing lays it flat again.
+        let at = if down { 1.0 * s } else { 0.0 };
+        let lift = if down { 0.0 } else { 0.2 + lit * 0.8 };
+        let fill = if primary {
+            mix_rgb(rgb(p::INK), rgb(p::BAR_HOVER), lit)
         } else {
-            let fill = mix_rgb(rgb(p::CREAM), rgb(p::PANEL_HOVER), lit);
-            l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, ink));
-            let t = 1.4 * s;
-            l.rects.push(rect([r[0] + t, r[1] + t], [r[2] - t, r[3] - t], 2.0 * s, fill));
-        }
-        let color = if primary { rgb(p::CREAM) } else { ink };
+            mix_rgb(rgb(p::PREVIEW_BG), rgb(p::PANEL_HOVER), lit)
+        };
+        paper(&mut self.draw.ui[1], [x, y + at], [x + width, y + h + at], fill, lift, s);
+        let color = if primary { rgb(p::CREAM) } else { rgb(p::INK) };
         let out = &mut self.draw.ui[1].glyphs;
-        draw_text(&mut self.text, out, label, Face::UiBold, size, x + 14.0 * s, y + h * 0.5 + size * 0.36, color, NO_HALO);
-        self.zone(r, action);
+        draw_text(&mut self.text, out, label, Face::UiBold, size, x + 14.0 * s, y + at + h * 0.5 + size * 0.36, color, NO_HALO);
+        self.zone([x, y, x + width, y + h], action);
         width
     }
 
@@ -770,15 +896,17 @@ impl App {
             let r = [x, top, x + size, top + size];
             let action = Action::Cmd(*cmd);
             let lit = self.hov(action);
+            let down = self.is_pressing(action);
+            let at = if down { 1.0 * s } else { 0.0 };
             let danger = *cmd == crate::actions::Cmd::Delete;
-            let wash = if danger { rgb(p::DANGER) } else { rgb(p::PANEL_HOVER) };
+            let wash = if danger { rgb(p::DANGER) } else { rgb(p::PREVIEW_BG) };
             let idle = rgb(p::INK);
             let ink = if danger { mix_rgb(idle, rgb(p::CREAM), lit) } else { idle };
             let l = &mut self.draw.ui[1];
             if lit > 0.0 {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, with_alpha(wash, lit)));
+                paper(l, [r[0], r[1] + at], [r[2], r[3] + at], with_alpha(wash, lit), if down { 0.0 } else { lit * 0.7 }, s);
             }
-            draw_icon(l, *icon, [x + size * 0.5, top + size * 0.5], s * 0.9, ink);
+            draw_icon(l, *icon, [x + size * 0.5, top + at + size * 0.5], s * 0.9, ink);
             self.zone(r, action);
             x += size + 2.0 * s;
         }
@@ -853,13 +981,22 @@ impl App {
         match &shown {
             Shown::Words(..) => {}
             Shown::Picture(iw, ih) => {
-                let fit = ((px1 - px0) / iw).min(card / ih);
+                // Mounted like a print: its own white border, sized to the picture.
+                let border = 7.0 * s;
+                let fit = ((px1 - px0 - border * 2.0) / iw).min((card - border * 2.0) / ih);
                 let (w2, h2) = (iw * fit, ih * fit);
-                self.draw.ui[1].rects.push(rect([card_rect[0], card_rect[1]], [card_rect[2], card_rect[3]], 3.0 * s, rgb(p::PREVIEW_BG)));
-                self.draw.ui[2].image_rect = Some(([mid[0] - w2 * 0.5, mid[1] - h2 * 0.5, mid[0] + w2 * 0.5, mid[1] + h2 * 0.5], 3.0 * s));
+                paper(
+                    &mut self.draw.ui[1],
+                    [mid[0] - w2 * 0.5 - border, mid[1] - h2 * 0.5 - border],
+                    [mid[0] + w2 * 0.5 + border, mid[1] + h2 * 0.5 + border],
+                    rgb(p::PRINT),
+                    0.5,
+                    s,
+                );
+                self.draw.ui[2].image_rect = Some(([mid[0] - w2 * 0.5, mid[1] - h2 * 0.5, mid[0] + w2 * 0.5, mid[1] + h2 * 0.5], 1.0 * s));
             }
             Shown::Archive(entries, total) => {
-                self.draw.ui[1].rects.push(rect([card_rect[0], card_rect[1]], [card_rect[2], card_rect[3]], 3.0 * s, rgb(p::PREVIEW_BG)));
+                paper(&mut self.draw.ui[1], [card_rect[0], card_rect[1]], [card_rect[2], card_rect[3]], rgb(p::PREVIEW_BG), 0.3, s);
                 let mut ly = y + 24.0 * s;
                 let inner = px1 - px0 - 24.0 * s;
                 for (entry, bytes) in entries {
@@ -879,11 +1016,11 @@ impl App {
                 }
             }
             Shown::Sound => {
-                self.draw.ui[1].rects.push(rect([card_rect[0], card_rect[1]], [card_rect[2], card_rect[3]], 3.0 * s, rgb(p::GROUND)));
+                paper(&mut self.draw.ui[1], [card_rect[0], card_rect[1]], [card_rect[2], card_rect[3]], rgb(p::GROUND), 0.3, s);
                 flower(self, [mid[0], y + 76.0 * s], 56.0 * s);
             }
             Shown::Flower(_) => {
-                self.draw.ui[1].rects.push(rect([card_rect[0], card_rect[1]], [card_rect[2], card_rect[3]], 3.0 * s, rgb(p::GROUND)));
+                paper(&mut self.draw.ui[1], [card_rect[0], card_rect[1]], [card_rect[2], card_rect[3]], rgb(p::GROUND), 0.3, s);
                 flower(self, mid, 74.0 * s);
             }
         }
@@ -935,6 +1072,7 @@ impl App {
             y += 21.0 * s;
         }
         y += 12.0 * s;
+        self.acts.panel_used = y;
 
         match shown {
             Shown::Words(lines, truncated) => {
@@ -961,7 +1099,8 @@ impl App {
         let line_h = 17.0 * s;
         let needed = lines.len().max(1) as f32 * line_h + if truncated { line_h * 1.4 } else { 0.0 } + 18.0 * s;
         let y1 = y1.min(y0 + needed);
-        self.draw.ui[1].rects.push(rect([x0, y0], [x1, y1], 3.0 * s, rgb(p::PREVIEW_BG)));
+        self.acts.panel_used = y1;
+        paper(&mut self.draw.ui[1], [x0, y0], [x1, y1], rgb(p::PREVIEW_BG), 0.3, s);
         self.zone([x0, y0, x1, y1], Action::Cmd(crate::actions::Cmd::QuickLook));
         if lines.is_empty() {
             let out = &mut self.draw.ui[1].glyphs;
@@ -1068,7 +1207,7 @@ impl App {
             Load::Loaded if kind == Kind::Places => plural(folders, "disk", "disks"),
             Load::Loading => "Reading…".to_string(),
             Load::Failed => "Couldn't read this folder".to_string(),
-            Load::Unloaded => "Closed branch".to_string(),
+            Load::Unloaded => "Closed. Double-click to open.".to_string(),
             Load::Loaded => format!("{}, {}", plural(folders, "folder", "folders"), plural(files, "file", "files")),
         };
         let out = &mut self.draw.ui[1].glyphs;
@@ -1157,9 +1296,9 @@ impl App {
             let lit = self.hov(action);
             let l = &mut self.draw.ui[1];
             if on {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, rgb(p::INK)));
+                paper(l, [r[0], r[1]], [r[2], r[3]], rgb(p::INK), 0.25, s);
             } else if lit > 0.0 {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, with_alpha(rgb(p::PANEL_HOVER), lit)));
+                l.rects.push(cut_rect([r[0], r[1]], [r[2], r[3]], CUT * s, with_alpha(rgb(p::PREVIEW_BG), lit)));
             }
             let color = if on { rgb(p::CREAM) } else { rgb(p::INK) };
             let out = &mut self.draw.ui[1].glyphs;
@@ -1230,7 +1369,7 @@ impl App {
             let action = Action::BinRestore(i);
             let lit = self.hov(action);
             let l = &mut self.draw.ui[3];
-            l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, mix_rgb(rgb(p::INK), rgb(p::BAR_HOVER), lit)));
+            paper(l, [r[0], r[1]], [r[2], r[3]], mix_rgb(rgb(p::INK), rgb(p::BAR_HOVER), lit), 0.2 + lit * 0.6, s);
             let out = &mut self.draw.ui[3].glyphs;
             draw_text(&mut self.text, out, "Restore", Face::UiBold, 12.5 * s, r[0] + 10.0 * s, top + 26.0 * s + 4.4 * s, rgb(p::CREAM), NO_HALO);
             let clipped = [r[0], r[1].max(y), r[2], r[3].min(y1)];
@@ -1238,6 +1377,7 @@ impl App {
                 self.zone(clipped, action);
             }
         }
+        self.acts.panel_used = (y + content).min(y1);
         self.scrollbar(x1 - 10.0 * s, y, x1 - 2.0 * s, y1, content, scroll, max_scroll);
     }
 
@@ -1261,10 +1401,10 @@ impl App {
             let action = if i == bin_at { Action::ShowBin } else { Action::Place(i) };
             let lit = self.hov(action);
             let l = &mut self.draw.ui[1];
-            l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, mix_rgb(rgb(p::PREVIEW_BG), rgb(p::PANEL_HOVER), lit)));
+            paper(l, [r[0], r[1]], [r[2], r[3]], mix_rgb(rgb(p::PREVIEW_BG), rgb(p::PANEL_HOVER), lit), 0.15 + lit * 0.7, s);
             let chip = 12.0 * s;
             let (ix, iy) = (cx + 19.0 * s, cy + height * 0.5);
-            l.rects.push(rect([ix - chip, iy - chip], [ix + chip, iy + chip], 3.0 * s, rgb(p::GROUND)));
+            l.rects.push(cut_rect([ix - chip, iy - chip], [ix + chip, iy + chip], CUT * s, rgb(p::GROUND)));
             if i == bin_at {
                 draw_icon(l, Icon::Trash, [ix, iy], s * 0.82, rgb(p::CREAM));
             } else {
@@ -1321,6 +1461,7 @@ impl App {
         let view = (y1 - y0).max(0.0);
         let content = self.list.len() as f32 * row_h + 8.0 * s;
         let max_scroll = (content - view).max(0.0);
+        self.acts.panel_used = (y0 + content).min(y1);
         self.panel_scroll.target = self.panel_scroll.target.clamp(0.0, max_scroll);
         if let Some(row) = self.selected_row {
             let top = row as f32 * row_h;
@@ -1357,9 +1498,9 @@ impl App {
             let lit = if hovered { 1.0 } else { 0.0f32 };
             let l = &mut self.draw.ui[3];
             if is_selected || aiming {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, rgb(p::INK)));
+                paper(l, [r[0], r[1] + 1.0 * s], [r[2], r[3] - 1.0 * s], rgb(p::INK), 0.25, s);
             } else if lit > 0.0 {
-                l.rects.push(rect([r[0], r[1]], [r[2], r[3]], 3.0 * s, rgb(p::PANEL_HOVER)));
+                l.rects.push(cut_rect([r[0], r[1] + 1.0 * s], [r[2], r[3] - 1.0 * s], CUT * s, rgb(p::PANEL_HOVER)));
             }
             let (row_ink, row_soft) = if is_selected || aiming { (rgb(p::CREAM), rgb(p::CREAM)) } else { (ink, soft) };
             let icon_x = r[0] + 16.0 * s;
@@ -1367,7 +1508,7 @@ impl App {
             let bud = species == p::BUD;
             // Each flower sits on a chip of the tree's own ground, where its colours were cut for.
             let chip = 12.5 * s;
-            l.rects.push(rect([icon_x - chip, cy - chip], [icon_x + chip, cy + chip], 3.0 * s, rgb(p::GROUND)));
+            l.rects.push(cut_rect([icon_x - chip, cy - chip], [icon_x + chip, cy + chip], CUT * s, rgb(p::GROUND)));
             l.flowers.push(FlowerInst {
                 pos: [icon_x, cy],
                 radius: if bud { 10.5 * s } else { 10.0 * s },
@@ -1451,6 +1592,8 @@ impl App {
                 };
                 owned.as_str()
             }
+            Action::TogglePanel if self.panel_hidden() => "Show the side panel (Ctrl+B)",
+            Action::TogglePanel => "Hide the side panel (Ctrl+B)",
             Action::Back => "Back (Alt+Left)",
             Action::Forward => "Forward (Alt+Right)",
             Action::Up => "Up one level (Backspace)",
@@ -1461,6 +1604,8 @@ impl App {
             Action::ToggleHidden => "Show hidden items (Ctrl+H)",
             Action::ToggleMotion if self.reduced_motion => "Turn full motion on",
             Action::ToggleMotion => "Reduce motion",
+            Action::ToggleSound if self.sounds.on => "Turn sounds off (Ctrl+M)",
+            Action::ToggleSound => "Turn sounds on (Ctrl+M)",
             _ => return,
         };
         let s = self.scale;
@@ -1473,8 +1618,7 @@ impl App {
         let y0 = if py < self.toolbar_height() { self.toolbar_height() + 6.0 * s } else { py - height - 22.0 * s };
         let (a, b) = ([x0, y0], [x0 + width, y0 + height]);
         let l = self.layer(5);
-        l.rects.push(soft_rect([a[0] + 1.0 * s, a[1] + 3.0 * s], [b[0] + 1.0 * s, b[1] + 3.0 * s], 3.0 * s, 3.0 * s, with_alpha(rgb(p::SHADOW), 0.45)));
-        l.rects.push(rect(a, b, 3.0 * s, rgb(p::INK)));
+        paper(l, a, b, rgb(p::INK), 0.5, s);
         let out = &mut self.draw.ui[5].glyphs;
         draw_text(&mut self.text, out, label, Face::Ui, size, x0 + 9.0 * s, y0 + height * 0.5 + 4.4 * s, rgb(p::CREAM), NO_HALO);
     }

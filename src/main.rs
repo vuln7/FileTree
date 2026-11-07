@@ -6,9 +6,11 @@
 mod actions;
 mod app;
 mod audio;
+mod sounds;
 #[cfg(feature = "capture")]
 mod capture;
 mod fs;
+mod garden;
 mod gpu;
 mod layout;
 mod ops;
@@ -122,6 +124,10 @@ impl ApplicationHandler for Host {
             window.scale_factor() as f32,
         );
         app.reduced_motion = platform::prefers_reduced_motion();
+        // Scenery that never stops would keep the whole processor drawing it.
+        app.garden.held_still = gpu.in_software;
+        app.sounds.on = !platform::sound_off_marker().is_some_and(|marker| marker.exists());
+        app.sounds.connect();
         self.gpu = Some(gpu);
         self.app = Some(app);
         self.window = Some(window.clone());
@@ -141,7 +147,9 @@ impl ApplicationHandler for Host {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let (Some(window), Some(_)) = (self.window.clone(), &self.app) else { return };
+        let (Some(window), Some(app)) = (self.window.clone(), &mut self.app) else { return };
+        // Anything done is timed against the real clock, even after a long still spell.
+        app.wall = self.started.elapsed().as_secs_f32();
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -207,6 +215,8 @@ impl ApplicationHandler for Host {
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if let Some(app) = &mut self.app {
+                    // Clicks are timed against the real clock, even after a long still spell.
+                    app.wall = self.started.elapsed().as_secs_f32();
                     match state {
                         ElementState::Pressed => app.on_pointer_down(),
                         ElementState::Released => app.on_pointer_up(),
@@ -322,6 +332,8 @@ impl Host {
                 "n" => Some(Key::NewFile),
                 "z" => Some(Key::Undo),
                 "a" => Some(Key::SelectAll),
+                "b" => Some(Key::TogglePanel),
+                "m" => Some(Key::ToggleSound),
                 "h" => Some(Key::ToggleHidden),
                 "r" => Some(Key::Reset),
                 _ => None,
@@ -344,11 +356,10 @@ impl Host {
     fn frame(&mut self, window: &Window) {
         let now = Instant::now();
         // A long gap (nothing was animating) must not count as one giant time step.
-        let elapsed = now.duration_since(self.last_frame).as_secs_f32();
-        let dt = elapsed.min(1.0 / 20.0);
+        let dt = now.duration_since(self.last_frame).as_secs_f32().min(1.0 / 20.0);
         self.last_frame = now;
         let (Some(app), Some(gpu)) = (&mut self.app, &mut self.gpu) else { return };
-        app.wall += elapsed;
+        app.wall = self.started.elapsed().as_secs_f32();
 
         app.pump_events();
         app.redraw = false;

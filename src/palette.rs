@@ -16,6 +16,8 @@ pub const INK: u32 = 0x14205c;
 pub const INK_SOFT: u32 = 0x4a5484;
 pub const PANEL_HOVER: u32 = 0xf6e9cf;
 pub const PREVIEW_BG: u32 = 0xeadfc4;
+/// The border of a picture mounted on the panel, a shade lighter than the sheet it sits on.
+pub const PRINT: u32 = 0xfffdf6;
 /// Only for actions that remove something, and for things that went wrong.
 pub const DANGER: u32 = 0xc8321b;
 pub const DANGER_HOVER: u32 = 0xdc4630;
@@ -26,6 +28,8 @@ pub const CODE_STRING: u32 = 0x0b6e60;
 pub const CODE_KEYWORD: u32 = 0x8a1f8f;
 pub const CODE_NUMBER: u32 = 0xa8430a;
 
+/// A firefly on a dark night. Paler than the path's lemon, so it can't be mistaken for it.
+pub const FIREFLY: u32 = 0xfff3b4;
 /// Reserved: the path to the selected item, and nothing else on the tree.
 pub const PATH: u32 = 0xffe45c;
 
@@ -50,3 +54,6 @@ pub const LEAF: f32 = 9.0;
 pub const BUD: f32 = 10.0;
 pub const PETAL: f32 = 11.0;
 pub const BLOSSOM: f32 = 12.0;
+/// Scenery, drawn whole by one instance each. They borrow a flower's colours, given in their seed.
+pub const BUTTERFLY: f32 = 13.0;
+pub const BIRD: f32 = 14.0;
